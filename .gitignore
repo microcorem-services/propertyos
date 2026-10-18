@@ -1,0 +1,32 @@
+# Node.js and Next.js
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases and database server files
+*.db
+*.sqlite
+*.sqlite3
+pgdata/
+postgres-data/
+
+# Test and OS artifacts
+.coverage
+coverage/
+.DS_Store

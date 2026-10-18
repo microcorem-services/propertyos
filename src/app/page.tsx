@@ -1,10 +1,86 @@
-const sampleProperties = [
-  {id:'P-101',name:'Riverside House',location:'Oxford',units:18,occupied:16,status:'Operational'},
-  {id:'P-102',name:'Westgate Offices',location:'Reading',units:12,occupied:10,status:'Operational'},
-  {id:'P-103',name:'Market Square',location:'Abingdon',units:8,occupied:5,status:'Review'},
-];
+'use client';
+
+import Link from 'next/link';
+import { useEffect, useState } from 'react';
+import { DashboardStats, Property, propertyApi } from '@/lib/api';
+
 export default function Home() {
- const total=sampleProperties.reduce((n,p)=>n+p.units,0);
- const occupied=sampleProperties.reduce((n,p)=>n+p.occupied,0);
- return <main className="shell"><aside className="sidebar"><div className="brand">MICROCOREM <span>PropertyOS</span></div><nav aria-label="Main navigation"><a className="active" href="/">Overview</a><a href="#properties">Properties</a></nav><p className="sidebarNote">Portfolio demo · Fictional records</p></aside><section className="content"><header><div><p className="eyebrow">ASSET MANAGEMENT</p><h1>Property overview</h1><p className="muted">A clear view of your property portfolio.</p></div><span className="tag">Demonstration</span></header><div className="metrics"><article><span>Properties</span><strong>{sampleProperties.length}</strong></article><article><span>Total units</span><strong>{total}</strong></article><article><span>Occupancy</span><strong>{Math.round(occupied/total*100)}%</strong></article></div><section className="panel" id="properties"><div className="panelHeading"><h2>Properties</h2><span className="muted">Sample data only</span></div><div className="tableWrap"><table><thead><tr><th>Property</th><th>Location</th><th>Units</th><th>Occupied</th><th>Status</th></tr></thead><tbody>{sampleProperties.map(p=><tr key={p.id}><td><b>{p.name}</b><small>{p.id}</small></td><td>{p.location}</td><td>{p.units}</td><td>{p.occupied}</td><td><span className={p.status==='Review'?'status review':'status'}>{p.status}</span></td></tr>)}</tbody></table></div></section><p className="footnote">Phase 1 is a static UI. Live data, authentication and editing are not implemented yet.</p></section></main>
+  const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [properties, setProperties] = useState<Property[]>([]);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([propertyApi.stats(), propertyApi.list()])
+      .then(([nextStats, nextProperties]) => {
+        setStats(nextStats);
+        setProperties(nextProperties.slice(0, 5));
+      })
+      .catch((loadError: Error) => setError(loadError.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  return (
+    <main className="shell">
+      <aside className="sidebar">
+        <div className="brand">MICROCOREM <span>PropertyOS</span></div>
+        <nav aria-label="Main navigation">
+          <Link className="active" href="/">Overview</Link>
+          <Link href="/properties">Properties</Link>
+        </nav>
+        <p className="sidebarNote">Portfolio demo · Fictional records</p>
+      </aside>
+      <section className="content">
+        <header>
+          <div>
+            <p className="eyebrow">ASSET MANAGEMENT</p>
+            <h1>Property overview</h1>
+            <p className="muted">A clear view of your property portfolio.</p>
+          </div>
+          <span className="tag">Demonstration</span>
+        </header>
+
+        {error && <p className="alert error" role="alert">Could not load portfolio: {error}</p>}
+
+        <div className="metrics" aria-label="Portfolio statistics">
+          <article><span>Properties</span><strong>{loading ? '—' : stats?.properties ?? 0}</strong></article>
+          <article><span>Total units</span><strong>{loading ? '—' : stats?.total_units ?? 0}</strong></article>
+          <article><span>Occupancy</span><strong>{loading ? '—' : `${stats?.occupancy_percent ?? 0}%`}</strong></article>
+        </div>
+
+        <section className="panel" id="properties">
+          <div className="panelHeading">
+            <h2>Properties</h2>
+            <Link className="textLink" href="/properties">Manage properties</Link>
+          </div>
+          {loading ? (
+            <p className="state" role="status">Loading portfolio…</p>
+          ) : error ? (
+            <p className="state">Portfolio data is unavailable.</p>
+          ) : properties.length === 0 ? (
+            <div className="state emptyState">
+              <p>No properties yet.</p>
+              <Link className="button primary" href="/properties">Add your first property</Link>
+            </div>
+          ) : (
+            <div className="tableWrap">
+              <table>
+                <thead><tr><th>Property</th><th>Location</th><th>Units</th><th>Occupied</th><th>Status</th></tr></thead>
+                <tbody>{properties.map((property) => (
+                  <tr key={property.id}>
+                    <td><b>{property.name}</b><small>{property.id.slice(0, 8)}</small></td>
+                    <td>{property.location}</td>
+                    <td>{property.units}</td>
+                    <td>{property.occupied}</td>
+                    <td><span className={`status ${property.status.toLowerCase()}`}>{property.status}</span></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+        </section>
+        <p className="footnote">Live portfolio data · Demonstration only · No authentication</p>
+      </section>
+    </main>
+  );
 }
