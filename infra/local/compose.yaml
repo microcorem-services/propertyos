@@ -1,0 +1,82 @@
+name: bow-era-local
+
+services:
+  organization-access-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${ORG_ACCESS_DB_NAME:?Set ORG_ACCESS_DB_NAME in infra/local/.env}
+      POSTGRES_USER: ${ORG_ACCESS_DB_USER:?Set ORG_ACCESS_DB_USER in infra/local/.env}
+      POSTGRES_PASSWORD: ${ORG_ACCESS_DB_PASSWORD:?Set ORG_ACCESS_DB_PASSWORD in infra/local/.env}
+    ports:
+      - "127.0.0.1:${ORG_ACCESS_DB_PORT:-55431}:5432"
+    volumes:
+      - organization-access-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  property-assets-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${PROPERTY_ASSETS_DB_NAME:?Set PROPERTY_ASSETS_DB_NAME in infra/local/.env}
+      POSTGRES_USER: ${PROPERTY_ASSETS_DB_USER:?Set PROPERTY_ASSETS_DB_USER in infra/local/.env}
+      POSTGRES_PASSWORD: ${PROPERTY_ASSETS_DB_PASSWORD:?Set PROPERTY_ASSETS_DB_PASSWORD in infra/local/.env}
+    ports:
+      - "127.0.0.1:${PROPERTY_ASSETS_DB_PORT:-55432}:5432"
+    volumes:
+      - property-assets-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  organization-access:
+    build:
+      context: ../../services/organization-access
+    environment:
+      SERVICE_PORT: ${ORG_ACCESS_PORT:-8101}
+      DATABASE_URL: postgresql+psycopg://${ORG_ACCESS_DB_USER}:${ORG_ACCESS_DB_PASSWORD}@organization-access-db:5432/${ORG_ACCESS_DB_NAME}
+    ports:
+      - "127.0.0.1:${ORG_ACCESS_PORT:-8101}:${ORG_ACCESS_PORT:-8101}"
+    depends_on:
+      organization-access-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['SERVICE_PORT'] + '/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  property-assets:
+    build:
+      context: ../../services/property-assets
+    environment:
+      SERVICE_PORT: ${PROPERTY_ASSETS_PORT:-8102}
+      DATABASE_URL: postgresql+psycopg://${PROPERTY_ASSETS_DB_USER}:${PROPERTY_ASSETS_DB_PASSWORD}@property-assets-db:5432/${PROPERTY_ASSETS_DB_NAME}
+    ports:
+      - "127.0.0.1:${PROPERTY_ASSETS_PORT:-8102}:${PROPERTY_ASSETS_PORT:-8102}"
+    depends_on:
+      property-assets-db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['SERVICE_PORT'] + '/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  organization-access-data:
+  property-assets-data:

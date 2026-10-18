@@ -8,6 +8,12 @@ Phase 2 provides a searchable and sortable properties table; create, view, edit,
 
 This is not production-ready: authentication, authorization, tenant isolation, audit history, operational monitoring, backups, and deployment are not implemented. Do not enter real customer or confidential information.
 
+## Microservices workspace (M0.1)
+
+The initial Organization & Access and Property & Asset Registry FastAPI service skeletons are under `services/`. They currently expose health endpoints only. Docker Compose provides independent local PostgreSQL containers and configurable ports; no service persistence, authentication, authorization, tenant isolation, AWS resources, or deployment is implemented yet. The existing Phase 2 frontend and backend remain in place and are not yet connected to the new services.
+
+See [local development](docs/local-development.md) for service startup and test instructions, and [ADR-0001](docs/adr/0001-domain-owned-microservices.md) for the accepted architecture decision.
+
 ## Technology
 
 - Next.js 15 and React 19 with TypeScript 5
