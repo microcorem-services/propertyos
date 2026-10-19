@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -21,6 +21,7 @@ from app.authorization import (
     AuthorizedMembership,
     authorize_organization_membership,
     get_authorization_session,
+    list_user_organizations,
     require_organization_membership,
 )
 from app.config import SERVICE_NAME
@@ -29,6 +30,7 @@ from app.schemas import (
     APIErrorResponse,
     InternalAuthorizationDecisionRequest,
     InternalAuthorizationDecisionResponse,
+    OrganizationChooserPageResponse,
     OrganizationResponse,
 )
 
@@ -38,8 +40,6 @@ _organization_membership_dependency = require_organization_membership()
 app = FastAPI(title="BOWERA Organization & Access", version="0.1.0")
 api_router = APIRouter(prefix=API_V1_PREFIX)
 internal_router = APIRouter(prefix="/internal/v1/authorization/decisions")
-app.include_router(api_router)
-app.include_router(internal_router)
 
 
 @app.exception_handler(AuthenticationFailure)
@@ -139,6 +139,41 @@ def get_organization(
     return organization
 
 
+@api_router.get(
+    "/users/me/organizations",
+    response_model=OrganizationChooserPageResponse,
+)
+def get_my_organizations(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=512),
+    principal: AuthenticatedPrincipal = Depends(verify_access_token),
+    session: Session = Depends(get_authorization_session),
+) -> OrganizationChooserPageResponse:
+    if set(request.query_params.keys()) - {"limit", "cursor"}:
+        raise HTTPException(status_code=422, detail="Unsupported query parameter.")
+    try:
+        page = list_user_organizations(
+            principal,
+            session,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid organization cursor.",
+        ) from error
+
+    return OrganizationChooserPageResponse(
+        organizations=[
+            {"id": organization.id, "name": organization.name}
+            for organization in page.organizations
+        ],
+        next_cursor=page.next_cursor,
+    )
+
+
 @internal_router.post(
     "",
     response_model=InternalAuthorizationDecisionResponse,
@@ -159,3 +194,7 @@ def decide_internal_authorization(
         operation=decision.operation,
         allowed=True,
     )
+
+
+app.include_router(api_router)
+app.include_router(internal_router)

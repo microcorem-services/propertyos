@@ -19,6 +19,16 @@ class OrganizationResponse(APIResponse):
     updated_at: datetime
 
 
+class OrganizationChooserItemResponse(APIResponse):
+    id: UUID
+    name: str
+
+
+class OrganizationChooserPageResponse(APIResponse):
+    organizations: list[OrganizationChooserItemResponse]
+    next_cursor: str | None
+
+
 class UserResponse(APIResponse):
     id: UUID
     external_subject: str

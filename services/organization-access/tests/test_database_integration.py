@@ -621,6 +621,95 @@ def test_organization_endpoint_returns_only_public_fields(
     assert response.json()["name"] == organization.name
 
 
+def test_my_organizations_endpoint_paginates_postgresql_results(
+    session: Session,
+    organization_api_client,
+):
+    subject = "pagination-fictional-cognito-subject"
+    user = User(external_subject=subject)
+    session.add(user)
+    organizations = []
+    for index in range(105):
+        organization = Organization(
+            name=f"Pagination Organization {index:03d}",
+            status=OrganizationStatus.ACTIVE.value,
+        )
+        session.add(organization)
+        session.flush()
+        session.add(
+            Membership(
+                organization_id=organization.id,
+                user_id=user.id,
+                role=MembershipRole.MEMBER.value,
+                status=MembershipStatus.ACTIVE.value,
+            )
+        )
+        organizations.append(organization)
+    session.flush()
+    client, make_token = organization_api_client
+    headers = _organization_headers(make_token, subject)
+
+    first_page = client.get(
+        "/api/v1/users/me/organizations",
+        params={"limit": 100},
+        headers=headers,
+    )
+    assert first_page.status_code == 200
+    assert len(first_page.json()["organizations"]) == 100
+    assert isinstance(first_page.json()["next_cursor"], str)
+
+    second_page = client.get(
+        "/api/v1/users/me/organizations",
+        params={
+            "limit": 100,
+            "cursor": first_page.json()["next_cursor"],
+        },
+        headers=headers,
+    )
+    assert second_page.status_code == 200
+    assert len(second_page.json()["organizations"]) == 5
+    assert second_page.json()["next_cursor"] is None
+
+    returned = (
+        first_page.json()["organizations"] + second_page.json()["organizations"]
+    )
+    assert returned == [
+        {"id": str(organization.id), "name": organization.name}
+        for organization in sorted(organizations, key=lambda item: (item.name, item.id))
+    ]
+
+
+def test_my_organizations_endpoint_isolates_verified_subject(
+    session: Session,
+    organization_api_client,
+):
+    own_organization, _, _ = create_member(
+        session,
+        subject="own-fictional-cognito-subject",
+    )
+    create_member(
+        session,
+        subject="other-fictional-cognito-subject",
+    )
+    client, make_token = organization_api_client
+
+    response = client.get(
+        "/api/v1/users/me/organizations",
+        headers=_organization_headers(
+            make_token,
+            "own-fictional-cognito-subject",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "organizations": [
+            {"id": str(own_organization.id), "name": own_organization.name}
+        ],
+        "next_cursor": None,
+    }
+
+
 def test_organization_endpoint_requires_authentication(organization_api_client):
     client, _ = organization_api_client
 

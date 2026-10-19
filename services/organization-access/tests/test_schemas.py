@@ -9,6 +9,8 @@ from app.models import MembershipRole, MembershipStatus, OrganizationStatus
 from app.schemas import (
     APIErrorResponse,
     MembershipResponse,
+    OrganizationChooserItemResponse,
+    OrganizationChooserPageResponse,
     OrganizationResponse,
     UserResponse,
 )
@@ -36,6 +38,21 @@ def test_organization_response_validates_model_attributes():
     assert datetime.fromisoformat(
         response.model_dump(mode="json")["created_at"].replace("Z", "+00:00")
     ) == now
+
+
+def test_organization_chooser_response_exposes_only_id_and_name():
+    organization_id = uuid4()
+    response = OrganizationChooserPageResponse.model_validate(
+        {
+            "organizations": [{"id": organization_id, "name": "Fictional"}],
+            "next_cursor": None,
+        }
+    )
+
+    assert response.organizations == [
+        OrganizationChooserItemResponse(id=organization_id, name="Fictional")
+    ]
+    assert set(response.organizations[0].model_dump()) == {"id", "name"}
 
 
 def test_user_response_contains_only_declared_user_fields():
@@ -117,11 +134,12 @@ def test_api_error_response_has_consistent_envelope():
     }
 
 
-def test_versioned_router_is_reserved_without_database_endpoints():
+def test_my_organizations_route_is_registered_under_versioned_api():
     assert API_V1_PREFIX == "/api/v1"
     assert api_router.prefix == API_V1_PREFIX
-    paths = {
-        path for route in app.routes if (path := getattr(route, "path", None)) is not None
+    paths = set(app.openapi()["paths"])
+    assert paths >= {
+        "/health",
+        "/ready",
+        f"{API_V1_PREFIX}/users/me/organizations",
     }
-    assert paths >= {"/health", "/ready"}
-    assert not any(path.startswith(API_V1_PREFIX) for path in paths)

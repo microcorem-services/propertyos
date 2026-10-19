@@ -20,6 +20,12 @@ Pydantic response schemas define the current organization, user, and membership 
 
 `GET /api/v1/organizations/{organization_id}` returns the public organization fields `id`, `name`, `status`, `created_at`, and `updated_at`. The caller must provide a valid Cognito access token and have an active membership in the explicitly requested active organization. Invalid UUIDs return `422`; authentication failures return `401`; missing, inactive, or mismatched memberships return a generic `403`; database failures return a sanitized `503`. The response excludes users, memberships, and internal database details.
 
+### Current user's active organizations
+
+`GET /api/v1/users/me/organizations` returns the caller's own active organization choices. It requires the same verified Cognito access token as other protected routes. The user is selected exclusively by the verified token's `sub` mapped to `users.external_subject`; the request accepts no user ID, subject, role, or membership claims.
+
+The response contains only `organizations` (items with `id` and `name`) and `next_cursor`. Only active memberships in active organizations are listed. Results are ordered by organization name and then UUID. `limit` defaults to 50 and must be between 1 and 100. When more results exist, `next_cursor` encodes the last returned organization's name and ID as a pagination position; pass it unchanged with the next request's `cursor` query parameter. The cursor controls only where the page begins: every page query still filters by the authenticated subject and active membership/organization status. Invalid cursors or limits return `422`; missing or invalid tokens return `401`; database failures return a sanitized `503`. The response never includes user IDs, membership IDs, roles, status, Cognito claims, or other private user data.
+
 Other proposed read-only endpoints, to be added only with authentication and authorization:
 
 - `GET /api/v1/organizations` — requires an authenticated identity and organization-scoped authorization.

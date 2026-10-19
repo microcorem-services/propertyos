@@ -1,9 +1,13 @@
+import base64
+import binascii
+import json
+import re
 from collections.abc import Collection, Generator
 from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import Depends, Path
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app import database
@@ -31,6 +35,22 @@ class AuthorizedMembership:
     organization_id: UUID
     user_id: UUID
     role: MembershipRole
+
+
+@dataclass(frozen=True)
+class OrganizationChooserItem:
+    id: UUID
+    name: str
+
+
+@dataclass(frozen=True)
+class OrganizationChooserPage:
+    organizations: list[OrganizationChooserItem]
+    next_cursor: str | None
+
+
+ORGANIZATION_PAGE_MAX_SIZE = 100
+_CURSOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
 
 
 def get_authorization_session() -> Generator[Session, None, None]:
@@ -109,4 +129,95 @@ def authorize_organization_membership(
         organization_id=membership.organization_id,
         user_id=membership.user_id,
         role=role,
+    )
+
+
+def _decode_organization_cursor(cursor: str) -> tuple[str, UUID]:
+    if _CURSOR_PATTERN.fullmatch(cursor) is None:
+        raise ValueError("Invalid organization cursor.")
+    try:
+        encoded = cursor.encode("ascii")
+        payload = base64.b64decode(
+            encoded + b"=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+        decoded = json.loads(payload)
+        if (
+            not isinstance(decoded, dict)
+            or set(decoded) != {"id", "name"}
+            or not isinstance(decoded["name"], str)
+            or len(decoded["name"]) > 200
+            or not isinstance(decoded["id"], str)
+        ):
+            raise ValueError("Invalid organization cursor.")
+        return decoded["name"], UUID(decoded["id"])
+    except (binascii.Error, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        raise ValueError("Invalid organization cursor.") from error
+
+
+def _encode_organization_cursor(name: str, organization_id: UUID) -> str:
+    payload = json.dumps(
+        {"id": str(organization_id), "name": name},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def list_user_organizations(
+    principal: AuthenticatedPrincipal,
+    session: Session,
+    *,
+    limit: int,
+    cursor: str | None = None,
+) -> OrganizationChooserPage:
+    if not 1 <= limit <= ORGANIZATION_PAGE_MAX_SIZE:
+        raise ValueError("Organization page size is out of range.")
+
+    statement = (
+        select(Organization.id, Organization.name)
+        .join(Membership, Membership.organization_id == Organization.id)
+        .join(User, User.id == Membership.user_id)
+        .where(
+            User.external_subject == principal.subject,
+            Organization.status == OrganizationStatus.ACTIVE.value,
+            Membership.status == MembershipStatus.ACTIVE.value,
+        )
+    )
+    if cursor is not None:
+        last_name, last_id = _decode_organization_cursor(cursor)
+        statement = statement.where(
+            or_(
+                Organization.name > last_name,
+                and_(
+                    Organization.name == last_name,
+                    Organization.id > last_id,
+                ),
+            )
+        )
+
+    statement = (
+        statement.order_by(Organization.name.asc(), Organization.id.asc())
+        .limit(limit + 1)
+    )
+    try:
+        rows = session.execute(statement).all()
+    except Exception as error:
+        raise AuthorizationServiceUnavailable from error
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    organizations = [
+        OrganizationChooserItem(id=organization_id, name=name)
+        for organization_id, name in page_rows
+    ]
+    next_cursor = (
+        _encode_organization_cursor(page_rows[-1][1], page_rows[-1][0])
+        if has_more
+        else None
+    )
+    return OrganizationChooserPage(
+        organizations=organizations,
+        next_cursor=next_cursor,
     )
