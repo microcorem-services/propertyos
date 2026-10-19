@@ -4,3 +4,7 @@ import os
 SERVICE_NAME = "organization-access"
 SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8101"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+COGNITO_ISSUER = os.getenv("COGNITO_ISSUER", "")
+COGNITO_USER_POOL_REGION = os.getenv("COGNITO_USER_POOL_REGION", "")
+COGNITO_APP_CLIENT_ID = os.getenv("COGNITO_APP_CLIENT_ID", "")
+COGNITO_REQUIRED_SCOPE = os.getenv("COGNITO_REQUIRED_SCOPE", "")

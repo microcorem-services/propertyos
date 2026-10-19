@@ -3,14 +3,30 @@ import os
 import re
 import subprocess
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import Engine, URL
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app import database
+from app.auth import AuthenticatedPrincipal, verify_access_token
+from app.authorization import (
+    AuthorizationDenied,
+    AuthorizationServiceUnavailable,
+    AuthorizedMembership,
+    get_authorization_session,
+    require_organization_membership,
+)
+from app.main import (
+    authorization_denied_handler,
+    authorization_service_unavailable_handler,
+)
 from app.models import (
     Membership,
     MembershipRole,
@@ -395,3 +411,256 @@ def test_database_timestamp_defaults_are_utc(session: Session):
         assert value.utcoffset().total_seconds() == 0
 
     assert organization.updated_at >= organization.created_at
+
+
+def make_authorization_client(
+    session_provider: Callable[[], Session],
+    principal: AuthenticatedPrincipal,
+    permitted_roles: set[MembershipRole] | None = None,
+) -> TestClient:
+    test_app = FastAPI()
+    test_app.add_exception_handler(AuthorizationDenied, authorization_denied_handler)
+    test_app.add_exception_handler(
+        AuthorizationServiceUnavailable,
+        authorization_service_unavailable_handler,
+    )
+    authorization_dependency = require_organization_membership(permitted_roles)
+
+    @test_app.get("/organizations/{organization_id}/resource")
+    def organization_resource(
+        authorization: AuthorizedMembership = Depends(authorization_dependency),
+    ):
+        return {
+            "organization_id": str(authorization.organization_id),
+            "role": authorization.role.value,
+        }
+
+    test_app.dependency_overrides[verify_access_token] = lambda: principal
+    test_app.dependency_overrides[get_authorization_session] = session_provider
+    return TestClient(test_app)
+
+
+def make_principal(subject: str = "fictional-cognito-subject"):
+    return AuthenticatedPrincipal(
+        subject=subject,
+        client_id="fictional-client",
+        scopes=frozenset({"organization-access/read"}),
+    )
+
+
+def create_member(
+    session: Session,
+    *,
+    subject="fictional-cognito-subject",
+    organization_status=OrganizationStatus.ACTIVE.value,
+    membership_status=MembershipStatus.ACTIVE.value,
+    role=MembershipRole.MEMBER.value,
+):
+    organization = Organization(
+        name=f"Fictional Organization {uuid.uuid4()}",
+        status=organization_status,
+    )
+    user = User(external_subject=subject)
+    membership = Membership(
+        organization=organization,
+        user=user,
+        role=role,
+        status=membership_status,
+    )
+    session.add(membership)
+    session.flush()
+    return organization, user, membership
+
+
+def assert_organization_access_denied(response):
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": {
+            "code": "forbidden",
+            "message": "Organization access denied",
+        }
+    }
+
+
+def assert_authorization_service_unavailable(response, *, secret: str | None = None):
+    assert response.status_code == 503
+    body = response.json()
+    assert body == {
+        "error": {
+            "code": "service_unavailable",
+            "message": "Authorization service unavailable",
+        }
+    }
+    if secret:
+        assert secret not in response.text
+
+
+def test_authorization_allows_matching_active_membership(session: Session):
+    organization, user, membership = create_member(session)
+    client = make_authorization_client(lambda: session, make_principal())
+
+    response = client.get(
+        f"/organizations/{organization.id}/resource"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "organization_id": str(organization.id),
+        "role": MembershipRole.MEMBER.value,
+    }
+    assert membership.user_id == user.id
+
+
+def test_authorization_denies_roles_not_explicitly_permitted(session: Session):
+    organization, _, _ = create_member(session, role=MembershipRole.MEMBER.value)
+    client = make_authorization_client(
+        lambda: session,
+        make_principal(),
+        permitted_roles={MembershipRole.ADMIN, MembershipRole.OWNER},
+    )
+
+    assert_organization_access_denied(
+        client.get(f"/organizations/{organization.id}/resource")
+    )
+
+
+@pytest.mark.parametrize(
+    ("member_options", "principal_subject"),
+    [
+        ({}, "unknown-fictional-subject"),
+        ({"subject": "another-fictional-subject"}, "fictional-cognito-subject"),
+        (
+            {"membership_status": MembershipStatus.SUSPENDED.value},
+            "fictional-cognito-subject",
+        ),
+        (
+            {"organization_status": OrganizationStatus.SUSPENDED.value},
+            "fictional-cognito-subject",
+        ),
+    ],
+)
+def test_authorization_denies_missing_or_inactive_memberships(
+    session: Session,
+    member_options: dict,
+    principal_subject: str,
+):
+    organization, _, _ = create_member(session, **member_options)
+    client = make_authorization_client(
+        lambda: session,
+        make_principal(principal_subject),
+    )
+
+    assert_organization_access_denied(
+        client.get(f"/organizations/{organization.id}/resource")
+    )
+
+
+def test_authorization_denies_cross_organization_attempt(session: Session):
+    authorized_organization, _, _ = create_member(session)
+    other_organization = Organization(
+        name="Fictional Unrelated Organization",
+        status=OrganizationStatus.ACTIVE.value,
+    )
+    session.add(other_organization)
+    session.flush()
+    client = make_authorization_client(lambda: session, make_principal())
+
+    assert authorized_organization.id != other_organization.id
+    assert_organization_access_denied(
+        client.get(f"/organizations/{other_organization.id}/resource")
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OperationalError("SELECT sensitive_sql", {}, OSError("private database host")),
+        TimeoutError("database pool timeout with private details"),
+        RuntimeError("unexpected SQL with password=fictional-secret"),
+    ],
+)
+def test_authorization_database_lookup_failures_return_sanitized_503(
+    failure: Exception,
+):
+    class FailingSession:
+        def execute(self, statement):
+            raise failure
+
+    client = make_authorization_client(
+        lambda: FailingSession(),
+        make_principal(),
+    )
+
+    response = client.get(f"/organizations/{uuid.uuid4()}/resource")
+
+    assert_authorization_service_unavailable(
+        response,
+        secret=str(failure),
+    )
+
+
+def test_authorization_database_not_configured_returns_sanitized_503(monkeypatch):
+    monkeypatch.setattr(database, "SessionLocal", None)
+    test_app = FastAPI()
+    test_app.add_exception_handler(
+        AuthorizationServiceUnavailable,
+        authorization_service_unavailable_handler,
+    )
+    authorization_dependency = require_organization_membership()
+
+    @test_app.get("/organizations/{organization_id}/resource")
+    def organization_resource(
+        authorization: AuthorizedMembership = Depends(authorization_dependency),
+    ):
+        return {"organization_id": str(authorization.organization_id)}
+
+    test_app.dependency_overrides[verify_access_token] = make_principal
+    client = TestClient(test_app)
+
+    response = client.get(f"/organizations/{uuid.uuid4()}/resource")
+
+    assert_authorization_service_unavailable(response)
+
+
+def test_invalid_organization_id_fails_before_database_lookup():
+    calls = []
+
+    def session_provider():
+        class UnusedSession:
+            def execute(self, statement):
+                calls.append(True)
+                raise AssertionError(
+                    "invalid organization ID must not query the database"
+                )
+
+        yield UnusedSession()
+
+    client = make_authorization_client(session_provider, make_principal())
+
+    response = client.get("/organizations/not-a-uuid/resource")
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_untrusted_user_and_role_parameters_do_not_override_token_identity(
+    session: Session,
+):
+    organization, user, membership = create_member(session)
+    client = make_authorization_client(lambda: session, make_principal())
+    other_user_id = uuid.uuid4()
+
+    response = client.get(
+        f"/organizations/{organization.id}/resource",
+        params={"user_id": str(other_user_id), "role": MembershipRole.OWNER.value},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["role"] == membership.role
+    assert membership.user_id == user.id
+    assert membership.user_id != other_user_id
+
+
+def test_authorization_rejects_untrusted_role_configuration():
+    with pytest.raises(ValueError):
+        require_organization_membership({"admin"})
