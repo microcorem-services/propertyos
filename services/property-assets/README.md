@@ -1,6 +1,6 @@
 # Property & Asset Registry Service
 
-The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metadata, and Alembic migrations. Its initial schema contains the `portfolios` table; portfolio CRUD APIs are not implemented yet. The published Phase 2 property API remains in `backend/`.
+The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metadata, and Alembic migrations. Its initial schema contains the `portfolios` table. The published Phase 2 property API remains in `backend/`.
 
 ## Internal workload token provider
 
@@ -13,6 +13,12 @@ The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metad
 - `COGNITO_ALLOW_INSECURE_TOKEN_ENDPOINT`: defaults to false. Set to `true` only for local testing; plain HTTP is then still restricted to `localhost` or a loopback IP address.
 
 Production token endpoints must use HTTPS. The provider sends a Basic client-authentication header and a form-encoded `grant_type=client_credentials` request with the required scope. It validates the bearer token response and caches the access token only in process memory until shortly before expiry; it does not persist credentials or tokens. Missing configuration, request failures, and malformed responses fail closed with a sanitized `WorkloadTokenError`. No real workload credentials or AWS resources are included in this repository. Provision the dedicated Cognito app client, secret and allowed scope separately before enabling service-to-service calls.
+
+## Protected portfolio listing
+
+`GET /api/v1/portfolios?organization_id=<UUID>` requires `Authorization: Bearer <user-access-token>`. The service forwards that token alongside a separate token from the workload-token provider to `POST /internal/v1/authorization/decisions` in Organization & Access, requesting `property-assets.portfolios.read`. It accepts access only when the response explicitly matches the requested organization and operation and sets `allowed` to `true`. Organization & Access remains the sole authority for membership; Property & Asset Registry never queries its database.
+
+Configure `ORGANIZATION_ACCESS_URL` as the Organization & Access base URL. `ORGANIZATION_ACCESS_CONNECT_TIMEOUT_SECONDS` and `ORGANIZATION_ACCESS_READ_TIMEOUT_SECONDS` are positive bounded timeouts in seconds (defaults: 2 and 3). HTTPS is required except when `ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP=true`; even then, HTTP is limited to `localhost` or a loopback IP. Missing configuration, unexpected service responses, and transport failures return sanitized `503`; invalid user credentials return `401`, and an explicit authorization denial returns `403`. Portfolio queries include the authorized `organization_id` predicate.
 
 ## Database setup
 

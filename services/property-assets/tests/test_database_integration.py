@@ -7,11 +7,16 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import httpx
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import authorization, config
+from app.authorization import get_authorization_workload_token
+from app.main import app, get_portfolio_session
 from app.models import (
     Building,
     BuildingStatus,
@@ -795,3 +800,70 @@ def test_unit_rejects_building_from_another_organization(session: Session):
             )
         )
         session.flush()
+
+
+def test_portfolio_listing_isolation_uses_authorized_organization(
+    monkeypatch,
+    session: Session,
+):
+    requested_organization_id = uuid.uuid4()
+    other_organization_id = uuid.uuid4()
+    requested_portfolio = Portfolio(
+        organization_id=requested_organization_id,
+        name="Authorized organization portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    other_portfolio = Portfolio(
+        organization_id=other_organization_id,
+        name="Other organization portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add_all([requested_portfolio, other_portfolio])
+    session.flush()
+    monkeypatch.setattr(
+        config,
+        "ORGANIZATION_ACCESS_URL",
+        "https://organization-access.example.test",
+    )
+
+    def provide_session():
+        yield session
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_portfolio_session,
+        provide_session,
+    )
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_authorization_workload_token,
+        lambda: "fictional-workload-token",
+    )
+    monkeypatch.setattr(
+        authorization.httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(
+            200,
+            json={
+                "organization_id": str(requested_organization_id),
+                "operation": "property-assets.portfolios.read",
+                "allowed": True,
+            },
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/portfolios",
+            params={"organization_id": str(requested_organization_id)},
+            headers={"Authorization": "Bearer fictional.user.signature"},
+        )
+
+    assert response.status_code == 200
+    assert [portfolio["id"] for portfolio in response.json()] == [
+        str(requested_portfolio.id)
+    ]
+    assert all(
+        portfolio["organization_id"] == str(requested_organization_id)
+        for portfolio in response.json()
+    )
