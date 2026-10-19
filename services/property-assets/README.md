@@ -1,6 +1,18 @@
 # Property & Asset Registry Service
 
-The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metadata, and Alembic migrations. Its initial schema contains the `portfolios` table; no CRUD API, authentication, or authorization is implemented yet. The published Phase 2 property API remains in `backend/`.
+The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metadata, and Alembic migrations. Its initial schema contains the `portfolios` table; portfolio CRUD APIs are not implemented yet. The published Phase 2 property API remains in `backend/`.
+
+## Internal workload token provider
+
+`app/workload_token.py` provides OAuth 2.0 `client_credentials` tokens for trusted calls to Organization & Access. Configure these environment variables at deployment time:
+
+- `COGNITO_TOKEN_ENDPOINT_URL`: the Cognito managed-login OAuth token endpoint URL.
+- `COGNITO_WORKLOAD_CLIENT_ID` and `COGNITO_WORKLOAD_CLIENT_SECRET`: credentials for the dedicated Property & Asset Registry workload app client. Do not commit or log the secret.
+- `COGNITO_WORKLOAD_REQUIRED_SCOPE`: the service scope registered for this workload and required by Organization & Access.
+- `COGNITO_TOKEN_CONNECT_TIMEOUT_SECONDS` and `COGNITO_TOKEN_READ_TIMEOUT_SECONDS`: positive HTTP timeouts in seconds (defaults: 2 and 3).
+- `COGNITO_ALLOW_INSECURE_TOKEN_ENDPOINT`: defaults to false. Set to `true` only for local testing; plain HTTP is then still restricted to `localhost` or a loopback IP address.
+
+Production token endpoints must use HTTPS. The provider sends a Basic client-authentication header and a form-encoded `grant_type=client_credentials` request with the required scope. It validates the bearer token response and caches the access token only in process memory until shortly before expiry; it does not persist credentials or tokens. Missing configuration, request failures, and malformed responses fail closed with a sanitized `WorkloadTokenError`. No real workload credentials or AWS resources are included in this repository. Provision the dedicated Cognito app client, secret and allowed scope separately before enabling service-to-service calls.
 
 ## Database setup
 
