@@ -658,3 +658,302 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+.bowera-portfolio-page {
+  display: flex;
+  flex-direction: column;
+}
+
+.bowera-portfolio-page .bow-era-topbar > a:first-child {
+  text-decoration: none;
+}
+
+.bowera-portfolio-back {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--bow-era-green);
+  font-size: 14px;
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: rgb(16 61 50 / 35%);
+  text-underline-offset: 5px;
+}
+
+.bowera-portfolio-back:hover {
+  text-decoration-color: var(--bow-era-green);
+}
+
+.bowera-portfolio-main {
+  flex: 1;
+  padding-block: clamp(48px, 7vw, 92px) clamp(64px, 8vw, 112px);
+}
+
+.bowera-portfolio-heading-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 40px;
+  margin-bottom: clamp(42px, 6vw, 72px);
+}
+
+.bowera-portfolio-heading-row .bow-era-heading {
+  margin: 0;
+}
+
+.bowera-portfolio-page .bow-era-title {
+  max-width: 780px;
+  font-size: clamp(40px, 5vw, 64px);
+  line-height: 1.15;
+}
+
+.bowera-portfolio-organisation {
+  max-width: 330px;
+  display: grid;
+  gap: 9px;
+  margin: 0 0 5px;
+  color: var(--bow-era-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.bowera-portfolio-organisation code {
+  color: var(--bow-era-green);
+  font-family: var(--font-manrope), sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: normal;
+  overflow-wrap: anywhere;
+  text-transform: none;
+}
+
+.bowera-portfolio-content {
+  padding-top: 28px;
+  border-top: 1px solid rgb(16 61 50 / 15%);
+}
+
+.bowera-portfolio-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.bowera-portfolio-section-heading .bow-era-eyebrow {
+  margin-bottom: 8px;
+}
+
+.bowera-portfolio-section-heading h2 {
+  margin: 0;
+  color: var(--bow-era-green);
+  font-family: var(--font-plus-jakarta), sans-serif;
+  font-size: clamp(24px, 3vw, 32px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+
+.bowera-portfolio-count {
+  margin: 0 0 4px;
+  color: var(--bow-era-muted);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.bowera-portfolio-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.bowera-portfolio-card {
+  min-width: 0;
+  min-height: 228px;
+  display: flex;
+  flex-direction: column;
+  padding: clamp(23px, 2.4vw, 32px);
+  border: 1px solid #e6eae7;
+  border-radius: 3px;
+  background: #ffffff;
+  box-shadow: 0 10px 34px rgb(16 61 50 / 5%);
+  transition:
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.bowera-portfolio-card:hover {
+  transform: translateY(-2px);
+  border-color: rgb(16 61 50 / 35%);
+  box-shadow: 0 16px 40px rgb(16 61 50 / 9%);
+}
+
+.bowera-portfolio-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.bowera-portfolio-status {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid rgb(16 61 50 / 16%);
+  border-radius: 20px;
+  color: var(--bow-era-green);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.bowera-portfolio-status-inactive {
+  border-color: #dedfdb;
+  color: #626b68;
+}
+
+.bowera-portfolio-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3d765d;
+}
+
+.bowera-portfolio-status-inactive .bowera-portfolio-status-dot {
+  background: #8d928e;
+}
+
+.bowera-portfolio-card-accent {
+  width: 34px;
+  height: 1px;
+  background: var(--bow-era-gold);
+}
+
+.bowera-portfolio-name {
+  margin: 28px 0 24px;
+  color: var(--bow-era-green);
+  font-family: var(--font-plus-jakarta), sans-serif;
+  font-size: clamp(20px, 2.1vw, 25px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.bowera-portfolio-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: auto 0 0;
+  padding-top: 17px;
+  border-top: 1px solid #edf0ed;
+}
+
+.bowera-portfolio-meta dt {
+  margin-bottom: 5px;
+  color: var(--bow-era-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.bowera-portfolio-meta dd {
+  margin: 0;
+  color: var(--bow-era-charcoal);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+@media (max-width: 900px) {
+  .bowera-portfolio-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .bowera-portfolio-heading-row {
+    align-items: start;
+    flex-direction: column;
+    gap: 24px;
+  }
+
+  .bowera-portfolio-organisation {
+    max-width: 100%;
+  }
+
+  .bowera-portfolio-page .bow-era-title {
+    font-size: clamp(38px, 5vw, 48px);
+  }
+}
+
+@media (max-width: 680px) {
+  .bowera-portfolio-page .bow-era-topbar {
+    flex-direction: row;
+    align-items: center;
+    min-height: 78px;
+    gap: 8px;
+  }
+
+  .bowera-portfolio-page .bow-era-brand-name {
+    font-size: 24px;
+  }
+
+  .bowera-portfolio-back {
+    max-width: 140px;
+    font-size: 12px;
+    text-align: right;
+  }
+
+  .bowera-portfolio-main {
+    padding-block: 42px 64px;
+  }
+
+  .bowera-portfolio-heading-row {
+    gap: 19px;
+    margin-bottom: 38px;
+  }
+
+  .bowera-portfolio-page .bow-era-title {
+    font-size: clamp(34px, 9vw, 42px);
+  }
+
+  .bowera-portfolio-page .bow-era-description {
+    max-width: 440px;
+  }
+
+  .bowera-portfolio-organisation {
+    font-size: 11px;
+  }
+
+  .bowera-portfolio-organisation code {
+    font-size: 11px;
+  }
+
+  .bowera-portfolio-content {
+    padding-top: 22px;
+  }
+
+  .bowera-portfolio-section-heading {
+    align-items: start;
+  }
+
+  .bowera-portfolio-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .bowera-portfolio-card {
+    min-height: 208px;
+    padding: 23px;
+  }
+
+  .bowera-portfolio-name {
+    font-size: 22px;
+  }
+}

@@ -290,6 +290,14 @@ export default function OrganizationsPage() {
                           'Select an organisation above'}
                       </p>
                     </div>
+                    {selectedOrganization && (
+                      <Link
+                        className="bow-era-button"
+                        href={`/portfolio?organizationId=${encodeURIComponent(selectedOrganization.id)}`}
+                      >
+                        View portfolios
+                      </Link>
+                    )}
                     {nextCursor && (
                       <button
                         className="bow-era-button bow-era-button-secondary"
