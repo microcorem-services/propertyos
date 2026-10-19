@@ -7,24 +7,39 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app import database
-from app.auth import AuthenticationConfigurationError, AuthenticationFailure
+from app.auth import (
+    AuthenticatedPrincipal,
+    AuthenticatedWorkload,
+    AuthenticationConfigurationError,
+    AuthenticationFailure,
+    verify_access_token,
+    verify_workload_access_token,
+)
 from app.authorization import (
     AuthorizationDenied,
     AuthorizationServiceUnavailable,
     AuthorizedMembership,
+    authorize_organization_membership,
     get_authorization_session,
     require_organization_membership,
 )
 from app.config import SERVICE_NAME
 from app.models import Organization, OrganizationStatus
-from app.schemas import APIErrorResponse, OrganizationResponse
+from app.schemas import (
+    APIErrorResponse,
+    InternalAuthorizationDecisionRequest,
+    InternalAuthorizationDecisionResponse,
+    OrganizationResponse,
+)
 
 API_V1_PREFIX = "/api/v1"
 _organization_membership_dependency = require_organization_membership()
 
 app = FastAPI(title="BOWERA Organization & Access", version="0.1.0")
 api_router = APIRouter(prefix=API_V1_PREFIX)
+internal_router = APIRouter(prefix="/internal/v1/authorization/decisions")
 app.include_router(api_router)
+app.include_router(internal_router)
 
 
 @app.exception_handler(AuthenticationFailure)
@@ -122,3 +137,25 @@ def get_organization(
         raise AuthorizationDenied
 
     return organization
+
+
+@internal_router.post(
+    "",
+    response_model=InternalAuthorizationDecisionResponse,
+)
+def decide_internal_authorization(
+    decision: InternalAuthorizationDecisionRequest,
+    _workload: AuthenticatedWorkload = Depends(verify_workload_access_token),
+    principal: AuthenticatedPrincipal = Depends(verify_access_token),
+    session: Session = Depends(get_authorization_session),
+) -> InternalAuthorizationDecisionResponse:
+    authorized = authorize_organization_membership(
+        decision.organization_id,
+        principal,
+        session,
+    )
+    return InternalAuthorizationDecisionResponse(
+        organization_id=authorized.organization_id,
+        operation=decision.operation,
+        allowed=True,
+    )

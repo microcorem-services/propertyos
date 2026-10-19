@@ -524,6 +524,75 @@ def organization_api_client(monkeypatch, session: Session):
     return client, make_token
 
 
+@pytest.fixture
+def internal_authorization_client(monkeypatch, session: Session):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk.update({"kid": "local-internal-key", "use": "sig", "alg": "RS256"})
+    jwks_client = PyJWKClient(f"{TEST_ISSUER}/.well-known/jwks.json", timeout=5)
+    monkeypatch.setattr(jwks_client, "fetch_data", lambda: {"keys": [jwk]})
+    monkeypatch.setattr(auth, "get_jwks_client", lambda: jwks_client)
+    monkeypatch.setattr(config, "COGNITO_ISSUER", TEST_ISSUER)
+    monkeypatch.setattr(config, "COGNITO_USER_POOL_REGION", "eu-west-1")
+    monkeypatch.setattr(config, "COGNITO_APP_CLIENT_ID", TEST_CLIENT_ID)
+    monkeypatch.setattr(config, "COGNITO_REQUIRED_SCOPE", TEST_REQUIRED_SCOPE)
+    monkeypatch.setattr(config, "COGNITO_WORKLOAD_CLIENT_ID", "fictional-service-client")
+    monkeypatch.setattr(
+        config,
+        "COGNITO_WORKLOAD_REQUIRED_SCOPE",
+        "property-assets/authorization",
+    )
+
+    def provide_session():
+        yield session
+
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        get_authorization_session,
+        provide_session,
+    )
+    client = TestClient(app)
+
+    def make_token(
+        *,
+        client_id: str = TEST_CLIENT_ID,
+        scope: str = TEST_REQUIRED_SCOPE,
+        token_use: str = "access",
+        subject: str | None = "fictional-cognito-subject",
+    ) -> str:
+        now = datetime.now(UTC)
+        claims = {
+            "iss": TEST_ISSUER,
+            "client_id": client_id,
+            "token_use": token_use,
+            "scope": scope,
+            "iat": now,
+            "exp": now + timedelta(minutes=5),
+        }
+        if subject is not None:
+            claims["sub"] = subject
+        return jwt.encode(
+            claims,
+            private_key,
+            algorithm="RS256",
+            headers={"kid": "local-internal-key"},
+        )
+
+    def request_headers(
+        *,
+        user_token: str | None = None,
+        workload_token: str | None = None,
+    ) -> dict[str, str]:
+        headers = {}
+        if user_token is not None:
+            headers["Authorization"] = f"Bearer {user_token}"
+        if workload_token is not None:
+            headers["X-Service-Authorization"] = f"Bearer {workload_token}"
+        return headers
+
+    return client, make_token, request_headers
+
+
 def _organization_headers(make_token: Callable[..., str], subject: str | None = None):
     token = make_token() if subject is None else make_token(subject)
     return {"Authorization": f"Bearer {token}"}
@@ -705,6 +774,328 @@ def test_organization_endpoint_database_failure_returns_sanitized_503(
     response = client.get(
         f"/api/v1/organizations/{organization.id}",
         headers=_organization_headers(make_token),
+    )
+
+    assert_authorization_service_unavailable(response, secret=secret_detail)
+
+
+def test_internal_decision_requires_active_member_and_both_credentials(
+    internal_authorization_client, session: Session
+):
+    organization, _, _ = create_member(session)
+    client, make_token, request_headers = internal_authorization_client
+
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(organization.id),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "organization_id": str(organization.id),
+        "operation": "property-assets.portfolios.read",
+        "allowed": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {},
+        {"user_token": True},
+        {"workload_token": True},
+    ],
+)
+def test_internal_decision_requires_both_credentials(
+    internal_authorization_client, credentials
+):
+    client, make_token, request_headers = internal_authorization_client
+    tokens = {
+        "user_token": make_token(),
+        "workload_token": make_token(
+            client_id="fictional-service-client",
+            scope="property-assets/authorization",
+            subject=None,
+        ),
+    }
+    headers = request_headers(**{
+        name: tokens[name] for name in credentials
+    })
+
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(uuid.uuid4()),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize("invalid_credential", ["user_token", "workload_token"])
+def test_internal_decision_rejects_malformed_credentials(
+    internal_authorization_client, invalid_credential
+):
+    client, make_token, request_headers = internal_authorization_client
+    user_token = make_token()
+    workload_token = make_token(
+        client_id="fictional-service-client",
+        scope="property-assets/authorization",
+        subject=None,
+    )
+    if invalid_credential == "user_token":
+        user_token = "not-a-jwt"
+    else:
+        workload_token = "not-a-jwt"
+
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(uuid.uuid4()),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=user_token,
+            workload_token=workload_token,
+        ),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_internal_decision_rejects_user_token_as_workload_credential(
+    internal_authorization_client,
+):
+    client, make_token, request_headers = internal_authorization_client
+    user_token = make_token()
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(uuid.uuid4()),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=user_token,
+            workload_token=user_token,
+        ),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    ("credential", "claims"),
+    [
+        ("user_token", {"client_id": "wrong-user-client"}),
+        ("user_token", {"scope": "openid"}),
+        ("workload_token", {"client_id": "wrong-service-client"}),
+        ("workload_token", {"scope": "openid"}),
+        ("workload_token", {"token_use": "id"}),
+    ],
+)
+def test_internal_decision_rejects_wrong_client_scope_or_token_type(
+    internal_authorization_client, credential, claims
+):
+    client, make_token, request_headers = internal_authorization_client
+    default_claims = (
+        {
+            "client_id": TEST_CLIENT_ID,
+            "scope": TEST_REQUIRED_SCOPE,
+            "subject": "fictional-cognito-subject",
+        }
+        if credential == "user_token"
+        else {
+            "client_id": "fictional-service-client",
+            "scope": "property-assets/authorization",
+            "subject": None,
+        }
+    )
+    default_claims.update(claims)
+    token = make_token(**default_claims)
+    user_token = make_token()
+    workload_token = make_token(
+        client_id="fictional-service-client",
+        scope="property-assets/authorization",
+        subject=None,
+    )
+    if credential == "user_token":
+        user_token = token
+    else:
+        workload_token = token
+
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(uuid.uuid4()),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=user_token,
+            workload_token=workload_token,
+        ),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.parametrize(
+    ("organization_status", "membership_status"),
+    [
+        (OrganizationStatus.SUSPENDED.value, MembershipStatus.ACTIVE.value),
+        (OrganizationStatus.ACTIVE.value, MembershipStatus.SUSPENDED.value),
+    ],
+)
+def test_internal_decision_denies_inactive_organization_or_membership(
+    internal_authorization_client,
+    session: Session,
+    organization_status: str,
+    membership_status: str,
+):
+    organization, _, _ = create_member(
+        session,
+        organization_status=organization_status,
+        membership_status=membership_status,
+    )
+    client, make_token, request_headers = internal_authorization_client
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(organization.id),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
+    )
+
+    assert_organization_access_denied(response)
+
+
+def test_internal_decision_denies_cross_organization_access(
+    internal_authorization_client, session: Session
+):
+    create_member(session)
+    other_organization, _, _ = create_member(
+        session,
+        subject="another-fictional-cognito-subject",
+    )
+    client, make_token, request_headers = internal_authorization_client
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(other_organization.id),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
+    )
+
+    assert_organization_access_denied(response)
+
+
+def test_internal_decision_rejects_unsupported_operation(
+    internal_authorization_client,
+):
+    client, make_token, request_headers = internal_authorization_client
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(uuid.uuid4()),
+            "operation": "property-assets.portfolios.write",
+        },
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+def test_internal_decision_rejects_caller_supplied_identity_or_role(
+    internal_authorization_client,
+):
+    client, make_token, request_headers = internal_authorization_client
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(uuid.uuid4()),
+            "operation": "property-assets.portfolios.read",
+            "user_id": str(uuid.uuid4()),
+            "role": "owner",
+        },
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
+    )
+
+    assert response.status_code == 422
+
+
+def test_internal_decision_database_failure_returns_sanitized_503(
+    monkeypatch,
+    internal_authorization_client,
+    session: Session,
+):
+    organization, _, _ = create_member(session)
+    client, make_token, request_headers = internal_authorization_client
+    secret_detail = "fictional internal database failure"
+
+    def fail_query(*args, **kwargs):
+        raise OperationalError("SELECT memberships", {}, Exception(secret_detail))
+
+    monkeypatch.setattr(session, "execute", fail_query)
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={
+            "organization_id": str(organization.id),
+            "operation": "property-assets.portfolios.read",
+        },
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
     )
 
     assert_authorization_service_unavailable(response, secret=secret_detail)

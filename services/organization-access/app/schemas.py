@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -40,3 +41,16 @@ class APIErrorDetail(BaseModel):
 
 class APIErrorResponse(BaseModel):
     error: APIErrorDetail
+
+
+class InternalAuthorizationDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    organization_id: UUID
+    operation: Literal["property-assets.portfolios.read"]
+
+
+class InternalAuthorizationDecisionResponse(BaseModel):
+    organization_id: UUID
+    operation: Literal["property-assets.portfolios.read"]
+    allowed: Literal[True]

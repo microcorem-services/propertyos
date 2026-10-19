@@ -1,9 +1,11 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 from urllib.parse import urlsplit
 
 import jwt
-from fastapi import Depends
+from fastapi import Depends, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWKClientError, PyJWTError
@@ -22,6 +24,12 @@ class AuthenticationFailure(Exception):
 @dataclass(frozen=True)
 class AuthenticatedPrincipal:
     subject: str
+    client_id: str
+    scopes: frozenset[str]
+
+
+@dataclass(frozen=True)
+class AuthenticatedWorkload:
     client_id: str
     scopes: frozenset[str]
 
@@ -82,31 +90,8 @@ def verify_access_token(
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise AuthenticationFailure
 
-    try:
-        issuer, expected_client_id, required_scope = _configured_identity()
-        signing_key = get_jwks_client().get_signing_key_from_jwt(credentials.credentials)
-        claims = jwt.decode(
-            credentials.credentials,
-            signing_key.key,
-            algorithms=["RS256"],
-            issuer=issuer,
-            options={
-                "require": [
-                    "exp",
-                    "iat",
-                    "iss",
-                    "sub",
-                    "token_use",
-                    "client_id",
-                    "scope",
-                ],
-                "verify_aud": False,
-            },
-        )
-    except AuthenticationConfigurationError:
-        raise
-    except (PyJWKClientError, PyJWTError, ValueError, TypeError) as error:
-        raise AuthenticationFailure from error
+    issuer, expected_client_id, required_scope = _configured_identity()
+    claims = _decode_access_token(credentials.credentials, issuer)
 
     subject = claims.get("sub")
     client_id = claims.get("client_id")
@@ -130,3 +115,77 @@ def verify_access_token(
         client_id=client_id,
         scopes=scopes,
     )
+
+
+def _configured_workload_identity() -> tuple[str, str, str]:
+    issuer, user_client_id, _ = _configured_identity()
+    workload_client_id = config.COGNITO_WORKLOAD_CLIENT_ID
+    required_scope = config.COGNITO_WORKLOAD_REQUIRED_SCOPE
+    if not workload_client_id or not required_scope:
+        raise AuthenticationConfigurationError(
+            "Cognito workload client ID and required scope must be configured"
+        )
+    if workload_client_id == user_client_id:
+        raise AuthenticationConfigurationError(
+            "Cognito user and workload clients must be distinct"
+        )
+    return issuer, workload_client_id, required_scope
+
+
+def verify_workload_access_token(
+    authorization: str | None = Header(
+        default=None,
+        alias="X-Service-Authorization",
+    ),
+) -> AuthenticatedWorkload:
+    if authorization is None:
+        raise AuthenticationFailure
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token.strip():
+        raise AuthenticationFailure
+
+    issuer, expected_client_id, required_scope = _configured_workload_identity()
+    claims = _decode_access_token(token.strip(), issuer, require_subject=False)
+
+    client_id = claims.get("client_id")
+    scope_claim = claims.get("scope")
+    if (
+        claims.get("token_use") != "access"
+        or client_id != expected_client_id
+        or not isinstance(scope_claim, str)
+    ):
+        raise AuthenticationFailure
+
+    scopes = frozenset(scope_claim.split())
+    if required_scope not in scopes:
+        raise AuthenticationFailure
+
+    return AuthenticatedWorkload(client_id=client_id, scopes=scopes)
+
+
+def _decode_access_token(
+    token: str,
+    issuer: str,
+    *,
+    require_subject: bool = True,
+) -> Mapping[str, Any]:
+    try:
+        signing_key = get_jwks_client().get_signing_key_from_jwt(token)
+        required_claims = ["exp", "iat", "iss", "token_use", "client_id", "scope"]
+        if require_subject:
+            required_claims.append("sub")
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={
+                "require": required_claims,
+                "verify_aud": False,
+            },
+        )
+    except AuthenticationConfigurationError:
+        raise
+    except (PyJWKClientError, PyJWTError, ValueError, TypeError) as error:
+        raise AuthenticationFailure from error
+    return claims

@@ -56,40 +56,57 @@ def require_organization_membership(
         principal: AuthenticatedPrincipal = Depends(verify_access_token),
         session: Session = Depends(get_authorization_session),
     ) -> AuthorizedMembership:
-        statement = (
-            select(Membership, Organization)
-            .join(Organization, Membership.organization_id == Organization.id)
-            .join(User, Membership.user_id == User.id)
-            .where(
-                User.external_subject == principal.subject,
-                Organization.id == organization_id,
-                Organization.status == OrganizationStatus.ACTIVE.value,
-                Membership.organization_id == organization_id,
-                Membership.status == MembershipStatus.ACTIVE.value,
-            )
-        )
-
-        try:
-            row = session.execute(statement).one_or_none()
-        except Exception as error:
-            raise AuthorizationServiceUnavailable from error
-
-        if row is None:
-            raise AuthorizationDenied
-
-        membership, _organization = row
-        try:
-            role = MembershipRole(membership.role)
-        except ValueError as error:
-            raise AuthorizationDenied from error
-
-        if allowed_roles is not None and role not in allowed_roles:
-            raise AuthorizationDenied
-
-        return AuthorizedMembership(
-            organization_id=membership.organization_id,
-            user_id=membership.user_id,
-            role=role,
+        return authorize_organization_membership(
+            organization_id,
+            principal,
+            session,
+            allowed_roles,
         )
 
     return dependency
+
+
+def authorize_organization_membership(
+    organization_id: UUID,
+    principal: AuthenticatedPrincipal,
+    session: Session,
+    permitted_roles: Collection[MembershipRole] | None = None,
+) -> AuthorizedMembership:
+    statement = (
+        select(Membership, Organization)
+        .join(Organization, Membership.organization_id == Organization.id)
+        .join(User, Membership.user_id == User.id)
+        .where(
+            User.external_subject == principal.subject,
+            Organization.id == organization_id,
+            Organization.status == OrganizationStatus.ACTIVE.value,
+            Membership.organization_id == organization_id,
+            Membership.status == MembershipStatus.ACTIVE.value,
+        )
+    )
+
+    try:
+        row = session.execute(statement).one_or_none()
+    except Exception as error:
+        raise AuthorizationServiceUnavailable from error
+
+    if row is None:
+        raise AuthorizationDenied
+
+    membership, _organization = row
+    try:
+        role = MembershipRole(membership.role)
+    except ValueError as error:
+        raise AuthorizationDenied from error
+
+    allowed_roles = (
+        None if permitted_roles is None else frozenset(permitted_roles)
+    )
+    if allowed_roles is not None and role not in allowed_roles:
+        raise AuthorizationDenied
+
+    return AuthorizedMembership(
+        organization_id=membership.organization_id,
+        user_id=membership.user_id,
+        role=role,
+    )

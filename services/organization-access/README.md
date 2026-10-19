@@ -42,6 +42,14 @@ The expected deployment boundary is a Next.js BFF using Authorization Code with 
 
 Successful authorization returns only an `AuthorizedMembership` context. Missing users or memberships, suspended records, and role mismatches return the same `403` response. Database lookup/configuration failures return a sanitized `503` and never grant access. Authentication proves the Cognito identity; membership authorization separately limits that identity to an active, explicitly requested organization. These helpers do not manage memberships.
 
+## Internal portfolio-read authorization decision
+
+`POST /internal/v1/authorization/decisions` is an internal service endpoint. It accepts only an `organization_id` UUID and the operation `property-assets.portfolios.read`. The caller must present both a user Cognito access token in `Authorization: Bearer ...` and a separate workload Cognito access token in `X-Service-Authorization: Bearer ...`.
+
+The user token is verified with the existing user-pool issuer, `COGNITO_APP_CLIENT_ID`, and `COGNITO_REQUIRED_SCOPE`; its verified `sub` is the only user identity used for membership lookup. The workload token is independently verified against the same configured Cognito issuer/JWKS, but must have the distinct `COGNITO_WORKLOAD_CLIENT_ID`, `COGNITO_WORKLOAD_REQUIRED_SCOPE`, and `token_use=access`. User and workload client IDs must differ. Do not forward the user token as the workload credential or trust caller-supplied user IDs or roles.
+
+An active user membership in an active organization receives a minimal decision containing only the organization ID, operation, and `allowed: true`. Missing or invalid credentials return a generic `401`, inactive or absent membership returns a generic `403`, invalid request fields or unsupported operations return `422`, and missing verifier configuration or database failures fail closed with a sanitized `503`. No membership records or personal information are returned. The service caller must be restricted to a trusted network/service boundary; this endpoint does not itself provision workload credentials.
+
 ## Database migrations
 
 The service owns its Alembic configuration in `alembic.ini` and `migrations/`. From the repository root, use the local Compose configuration to apply migrations to the dedicated `bowera_org_access` development database:
