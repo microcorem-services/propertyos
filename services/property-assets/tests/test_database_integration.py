@@ -11,7 +11,7 @@ from sqlalchemy.engine import Engine, URL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Portfolio, PortfolioStatus
+from app.models import Portfolio, PortfolioStatus, Site, SiteStatus
 
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
@@ -96,8 +96,8 @@ def integration_database():
         database=EXPECTED_DATABASE,
     )
     engine = create_engine(database_url, connect_args={"connect_timeout": 5})
-    schema_name = f"m05b_test_{uuid.uuid4().hex}"
-    if not re.fullmatch(r"m05b_test_[0-9a-f]{32}", schema_name):
+    schema_name = f"m05c_test_{uuid.uuid4().hex}"
+    if not re.fullmatch(r"m05c_test_[0-9a-f]{32}", schema_name):
         engine.dispose()
         raise RuntimeError("Refusing integration tests: invalid generated schema name")
 
@@ -291,21 +291,188 @@ def test_initial_migration_can_upgrade_and_downgrade(integration_database):
     engine, schema_url = integration_database
 
     with engine.connect() as connection:
-        assert "portfolios" in inspect(connection).get_table_names()
+        assert {"portfolios", "sites"} <= set(inspect(connection).get_table_names())
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == "0002_sites"
+
+    _run_alembic(schema_url, "downgrade", "0001_initial_portfolio")
+    with engine.connect() as connection:
+        table_names = set(inspect(connection).get_table_names())
+        assert "portfolios" in table_names
+        assert "sites" not in table_names
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
         ).scalar_one() == "0001_initial_portfolio"
-
-    _run_alembic(schema_url, "downgrade", "base")
-    with engine.connect() as connection:
-        assert "portfolios" not in inspect(connection).get_table_names()
-        assert connection.execute(
-            text("SELECT version_num FROM alembic_version")
-        ).scalar_one_or_none() is None
 
     _run_alembic(schema_url, "upgrade", "head")
     with engine.connect() as connection:
-        assert "portfolios" in inspect(connection).get_table_names()
+        assert {"portfolios", "sites"} <= set(inspect(connection).get_table_names())
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == "0001_initial_portfolio"
+        ).scalar_one() == "0002_sites"
+
+
+def test_site_can_be_created_with_its_portfolio(session: Session):
+    organization_id = uuid.uuid4()
+    portfolio = Portfolio(
+        organization_id=organization_id,
+        name="Fictional Site Portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add(portfolio)
+    session.flush()
+    site = Site(
+        organization_id=organization_id,
+        portfolio_id=portfolio.id,
+        name="Fictional Site",
+        address="1 Example Street, Exampleton",
+        status=SiteStatus.ACTIVE.value,
+    )
+    session.add(site)
+    session.flush()
+    session.expire_all()
+
+    retrieved = session.get(Site, site.id)
+
+    assert retrieved is not None
+    assert isinstance(retrieved.id, uuid.UUID)
+    assert retrieved.organization_id == organization_id
+    assert retrieved.portfolio_id == portfolio.id
+    assert retrieved.portfolio.id == portfolio.id
+    assert retrieved.name == "Fictional Site"
+    assert retrieved.address == "1 Example Street, Exampleton"
+    assert retrieved.status == SiteStatus.ACTIVE.value
+    assert retrieved.created_at.utcoffset().total_seconds() == 0
+    assert retrieved.updated_at.utcoffset().total_seconds() == 0
+
+
+def test_site_can_omit_optional_address(session: Session):
+    portfolio = Portfolio(
+        organization_id=uuid.uuid4(),
+        name="Portfolio Without Address",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add(portfolio)
+    session.flush()
+    site = Site(
+        organization_id=portfolio.organization_id,
+        portfolio_id=portfolio.id,
+        name="Addressless Site",
+        status=SiteStatus.ACTIVE.value,
+    )
+    session.add(site)
+    session.flush()
+
+    assert site.address is None
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+def test_site_name_must_not_be_empty(session: Session, name: str):
+    portfolio = Portfolio(
+        organization_id=uuid.uuid4(),
+        name="Non-empty Site Name Portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add(portfolio)
+    session.flush()
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Site.__table__.insert().values(
+                organization_id=portfolio.organization_id,
+                portfolio_id=portfolio.id,
+                name=name,
+                status=SiteStatus.ACTIVE.value,
+            )
+        )
+        session.flush()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("organization_id", None),
+        ("portfolio_id", None),
+        ("name", None),
+        ("status", None),
+    ],
+)
+def test_site_required_fields_are_enforced(
+    session: Session,
+    field_name: str,
+    value,
+):
+    portfolio = Portfolio(
+        organization_id=uuid.uuid4(),
+        name="Required Fields Portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add(portfolio)
+    session.flush()
+    values = {
+        "organization_id": portfolio.organization_id,
+        "portfolio_id": portfolio.id,
+        "name": "Required Fields Site",
+        "status": SiteStatus.ACTIVE.value,
+    }
+    values[field_name] = value
+
+    with pytest.raises(IntegrityError):
+        session.execute(Site.__table__.insert().values(**values))
+        session.flush()
+
+
+def test_site_rejects_invalid_status(session: Session):
+    portfolio = Portfolio(
+        organization_id=uuid.uuid4(),
+        name="Site Status Portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add(portfolio)
+    session.flush()
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Site.__table__.insert().values(
+                organization_id=portfolio.organization_id,
+                portfolio_id=portfolio.id,
+                name="Invalid Status Site",
+                status="archived",
+            )
+        )
+        session.flush()
+
+
+def test_site_rejects_nonexistent_portfolio(session: Session):
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Site.__table__.insert().values(
+                organization_id=uuid.uuid4(),
+                portfolio_id=uuid.uuid4(),
+                name="Missing Portfolio Site",
+                status=SiteStatus.ACTIVE.value,
+            )
+        )
+        session.flush()
+
+
+def test_site_rejects_portfolio_from_another_organization(session: Session):
+    portfolio = Portfolio(
+        organization_id=uuid.uuid4(),
+        name="Portfolio Organization One",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    session.add(portfolio)
+    session.flush()
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Site.__table__.insert().values(
+                organization_id=uuid.uuid4(),
+                portfolio_id=portfolio.id,
+                name="Cross Organization Site",
+                status=SiteStatus.ACTIVE.value,
+            )
+        )
+        session.flush()
