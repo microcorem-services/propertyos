@@ -11,6 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && adduser --system --ingroup app app
 
 COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 USER app
 
 EXPOSE 8000

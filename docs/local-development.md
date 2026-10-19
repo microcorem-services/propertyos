@@ -1,6 +1,6 @@
 # Local Microservices Development
 
-M0.1 adds two independent FastAPI health-only service skeletons. Their database URLs are configured, and Compose starts separate local PostgreSQL instances, but neither service currently connects to its database or persists domain data. No Cognito authentication, authorization, organisation isolation, event messaging, or AWS deployment is implemented. Do not use real customer data.
+M0.2A adds a synchronous PostgreSQL connection and `/ready` check to the Organization & Access service. The Property & Asset Registry remains a health-only skeleton and does not connect to its database. Neither service currently persists domain data. No Cognito authentication, authorization, organisation isolation, event messaging, or AWS deployment is implemented. Do not use real customer data.
 
 ## Prerequisites
 
@@ -38,7 +38,7 @@ Or start both:
 docker compose --env-file infra/local/.env -f infra/local/compose.yaml up --build
 ```
 
-The default health URLs are `http://localhost:8101/health` and `http://localhost:8102/health`. Default PostgreSQL host ports are 55431 and 55432. Database ports bind to loopback only. Each service has its own database container, user, database name, and named volume.
+The default health URLs are `http://localhost:8101/health` and `http://localhost:8102/health`. Organization & Access readiness, including its PostgreSQL connectivity check, is at `http://localhost:8101/ready`. Default PostgreSQL host ports are 55431 and 55432. Database ports bind to loopback only. Each service has its own database container, user, database name, and named volume.
 
 ## Stop services and data
 
@@ -62,7 +62,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-Run the equivalent commands from `services/property-assets`. Tests use FastAPI's test client and do not require Docker or PostgreSQL.
+Run the equivalent commands from `services/property-assets`. Tests use FastAPI's test client. Organization & Access database checks use SQLite and simulated connection failure, so its tests do not require Docker or PostgreSQL.
 
 ## Run a service without Compose
 
@@ -72,7 +72,7 @@ From the respective service directory, install its runtime dependencies in a loc
 SERVICE_PORT=8101 uvicorn app.main:app --host 127.0.0.1 --port 8101
 ```
 
-Use a different `SERVICE_PORT` and `--port` for the property-assets service (default 8102). At this milestone the health-only services do not open database connections, so they can start without PostgreSQL.
+Use a different `SERVICE_PORT` and `--port` for the property-assets service (default 8102). The Organization & Access service can start without PostgreSQL, but `/ready` returns `503` until its configured database is reachable. Its `/health` endpoint remains independent of PostgreSQL. The Property & Asset Registry service remains health-only and does not open database connections.
 
 ## Existing Phase 2 application
 
