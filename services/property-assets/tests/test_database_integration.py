@@ -11,7 +11,14 @@ from sqlalchemy.engine import Engine, URL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Portfolio, PortfolioStatus, Site, SiteStatus
+from app.models import (
+    Building,
+    BuildingStatus,
+    Portfolio,
+    PortfolioStatus,
+    Site,
+    SiteStatus,
+)
 
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
@@ -96,8 +103,8 @@ def integration_database():
         database=EXPECTED_DATABASE,
     )
     engine = create_engine(database_url, connect_args={"connect_timeout": 5})
-    schema_name = f"m05c_test_{uuid.uuid4().hex}"
-    if not re.fullmatch(r"m05c_test_[0-9a-f]{32}", schema_name):
+    schema_name = f"m05c2_test_{uuid.uuid4().hex}"
+    if not re.fullmatch(r"m05c2_test_[0-9a-f]{32}", schema_name):
         engine.dispose()
         raise RuntimeError("Refusing integration tests: invalid generated schema name")
 
@@ -291,26 +298,31 @@ def test_initial_migration_can_upgrade_and_downgrade(integration_database):
     engine, schema_url = integration_database
 
     with engine.connect() as connection:
-        assert {"portfolios", "sites"} <= set(inspect(connection).get_table_names())
+        assert {"portfolios", "sites", "buildings"} <= set(
+            inspect(connection).get_table_names()
+        )
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == "0002_sites"
+        ).scalar_one() == "0003_buildings"
 
-    _run_alembic(schema_url, "downgrade", "0001_initial_portfolio")
+    _run_alembic(schema_url, "downgrade", "0002_sites")
     with engine.connect() as connection:
         table_names = set(inspect(connection).get_table_names())
         assert "portfolios" in table_names
-        assert "sites" not in table_names
-        assert connection.execute(
-            text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == "0001_initial_portfolio"
-
-    _run_alembic(schema_url, "upgrade", "head")
-    with engine.connect() as connection:
-        assert {"portfolios", "sites"} <= set(inspect(connection).get_table_names())
+        assert "sites" in table_names
+        assert "buildings" not in table_names
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
         ).scalar_one() == "0002_sites"
+
+    _run_alembic(schema_url, "upgrade", "head")
+    with engine.connect() as connection:
+        assert {"portfolios", "sites", "buildings"} <= set(
+            inspect(connection).get_table_names()
+        )
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == "0003_buildings"
 
 
 def test_site_can_be_created_with_its_portfolio(session: Session):
@@ -473,6 +485,141 @@ def test_site_rejects_portfolio_from_another_organization(session: Session):
                 portfolio_id=portfolio.id,
                 name="Cross Organization Site",
                 status=SiteStatus.ACTIVE.value,
+            )
+        )
+        session.flush()
+
+
+def _create_site(session: Session, organization_id: uuid.UUID) -> Site:
+    portfolio = Portfolio(
+        organization_id=organization_id,
+        name="Fictional Building Test Portfolio",
+        status=PortfolioStatus.ACTIVE.value,
+    )
+    site = Site(
+        organization_id=organization_id,
+        portfolio=portfolio,
+        name="Fictional Building Test Site",
+        status=SiteStatus.ACTIVE.value,
+    )
+    session.add(site)
+    session.flush()
+    return site
+
+
+def test_building_can_be_created_with_its_site(session: Session):
+    organization_id = uuid.uuid4()
+    site = _create_site(session, organization_id)
+    building = Building(
+        organization_id=organization_id,
+        site_id=site.id,
+        name="Fictional Building",
+        building_code="BLDG-001",
+        address="2 Example Road, Exampleton",
+        status=BuildingStatus.ACTIVE.value,
+    )
+    session.add(building)
+    session.flush()
+    session.expire_all()
+
+    retrieved = session.get(Building, building.id)
+
+    assert retrieved is not None
+    assert isinstance(retrieved.id, uuid.UUID)
+    assert retrieved.organization_id == organization_id
+    assert retrieved.site_id == site.id
+    assert retrieved.site.id == site.id
+    assert retrieved.name == "Fictional Building"
+    assert retrieved.building_code == "BLDG-001"
+    assert retrieved.address == "2 Example Road, Exampleton"
+    assert retrieved.status == BuildingStatus.ACTIVE.value
+    assert retrieved.created_at.utcoffset().total_seconds() == 0
+    assert retrieved.updated_at.utcoffset().total_seconds() == 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("organization_id", None),
+        ("site_id", None),
+        ("name", None),
+        ("status", None),
+    ],
+)
+def test_building_required_fields_are_enforced(
+    session: Session,
+    field_name: str,
+    value,
+):
+    site = _create_site(session, uuid.uuid4())
+    values = {
+        "organization_id": site.organization_id,
+        "site_id": site.id,
+        "name": "Required Fields Building",
+        "status": BuildingStatus.ACTIVE.value,
+    }
+    values[field_name] = value
+
+    with pytest.raises(IntegrityError):
+        session.execute(Building.__table__.insert().values(**values))
+        session.flush()
+
+
+@pytest.mark.parametrize("name", ["", "   "])
+def test_building_name_must_not_be_empty(session: Session, name: str):
+    site = _create_site(session, uuid.uuid4())
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Building.__table__.insert().values(
+                organization_id=site.organization_id,
+                site_id=site.id,
+                name=name,
+                status=BuildingStatus.ACTIVE.value,
+            )
+        )
+        session.flush()
+
+
+def test_building_rejects_invalid_status(session: Session):
+    site = _create_site(session, uuid.uuid4())
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Building.__table__.insert().values(
+                organization_id=site.organization_id,
+                site_id=site.id,
+                name="Invalid Status Building",
+                status="archived",
+            )
+        )
+        session.flush()
+
+
+def test_building_rejects_missing_site(session: Session):
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Building.__table__.insert().values(
+                organization_id=uuid.uuid4(),
+                site_id=uuid.uuid4(),
+                name="Missing Site Building",
+                status=BuildingStatus.ACTIVE.value,
+            )
+        )
+        session.flush()
+
+
+def test_building_rejects_site_from_another_organization(session: Session):
+    site = _create_site(session, uuid.uuid4())
+    other_organization_id = uuid.uuid4()
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            Building.__table__.insert().values(
+                organization_id=other_organization_id,
+                site_id=site.id,
+                name="Cross Organization Building",
+                status=BuildingStatus.ACTIVE.value,
             )
         )
         session.flush()

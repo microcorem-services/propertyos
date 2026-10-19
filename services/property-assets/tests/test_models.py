@@ -6,19 +6,27 @@ from sqlalchemy import (
     DateTime,
     ForeignKeyConstraint,
     Index,
+    String,
     Text,
     UniqueConstraint,
 )
 from sqlalchemy.sql.sqltypes import Uuid
 
 from app.database import Base
-from app.models import Portfolio, PortfolioStatus, Site, SiteStatus
+from app.models import (
+    Building,
+    BuildingStatus,
+    Portfolio,
+    PortfolioStatus,
+    Site,
+    SiteStatus,
+)
 
 
 def test_portfolio_table_and_uuid_primary_key_are_declared():
-    assert set(Base.metadata.tables) == {"portfolios", "sites"}
+    assert set(Base.metadata.tables) == {"portfolios", "sites", "buildings"}
 
-    for model in (Portfolio, Site):
+    for model in (Portfolio, Site, Building):
         primary_key = model.__table__.c.id
         assert primary_key.primary_key
         assert primary_key.nullable is False
@@ -139,3 +147,78 @@ def test_site_name_status_constraints_and_lookup_indexes_are_declared():
     }
     assert ("organization_id",) in indexes
     assert ("portfolio_id",) in indexes
+
+
+def test_building_required_fields_and_utc_timestamps_are_declared():
+    for column_name in (
+        "organization_id",
+        "site_id",
+        "name",
+        "status",
+        "created_at",
+        "updated_at",
+    ):
+        assert Building.__table__.c[column_name].nullable is False
+
+    assert Building.__table__.c.building_code.nullable is True
+    assert Building.__table__.c.address.nullable is True
+    assert isinstance(Building.__table__.c.building_code.type, String)
+    assert isinstance(Building.__table__.c.address.type, Text)
+    for column_name in ("created_at", "updated_at"):
+        timestamp = Building.__table__.c[column_name]
+        assert isinstance(timestamp.type, DateTime)
+        assert timestamp.type.timezone is True
+        assert timestamp.default is not None
+        assert timestamp.default.arg(None).utcoffset() == UTC.utcoffset(None)
+
+    assert (
+        Building.__table__.c.updated_at.onupdate.arg(None).utcoffset()
+        == UTC.utcoffset(None)
+    )
+
+
+def test_building_organization_site_composite_foreign_key_and_indexes():
+    constraints = [
+        constraint
+        for constraint in Building.__table__.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    ]
+    assert len(constraints) == 1
+    assert constraints[0].name == "fk_buildings_site_organization"
+    assert tuple(column.name for column in constraints[0].columns) == (
+        "site_id",
+        "organization_id",
+    )
+    assert tuple(element.target_fullname for element in constraints[0].elements) == (
+        "sites.id",
+        "sites.organization_id",
+    )
+
+    site_unique_constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in Site.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert site_unique_constraints == {
+        "uq_sites_id_organization": ("id", "organization_id")
+    }
+
+    indexes = {
+        tuple(column.name for column in index.columns)
+        for index in Building.__table__.indexes
+    }
+    assert ("organization_id",) in indexes
+    assert ("site_id",) in indexes
+
+
+def test_building_name_and_status_constraints_are_declared():
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in Building.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert checks == {
+        "ck_buildings_name_not_empty": "length(trim(name)) > 0",
+        "ck_buildings_status": "status IN ('active', 'inactive')",
+    }
+    assert {status.value for status in BuildingStatus} == {"active", "inactive"}
