@@ -81,3 +81,11 @@ Run the frontend TypeScript check with `npm run lint`, and create a production b
 Only fictional demonstration records are included in the optional seed and tests. The API currently has no authentication and only allows browser requests from localhost development origins. Do not deploy it or expose it to untrusted networks. Never commit `.env` files, credentials, real tenant information, or private corporate assets. Review files and history before publication.
 
 This project uses AI-assisted development. Review implementation, tests, and security decisions before production use.
+
+## Next.js server-side session foundation
+
+The App Router has a server-only session abstraction in `src/lib/auth/`. It creates cryptographically random opaque identifiers, stores only a SHA-256 digest as the session-store key, rotates identifiers atomically, and enforces an eight-hour absolute lifetime and a thirty-minute sliding idle lifetime by default. Production cookies use the `__Host-propertyos_session` name with `HttpOnly`, `Secure`, `SameSite=Lax`, and `Path=/`. Local development uses a non-Secure cookie unless `SESSION_COOKIE_SECURE=true` is set; production cannot disable `Secure`.
+
+This milestone does not implement Cognito login/callback, a session-store adapter, or a portfolio BFF route. `SessionStore` is an interface; a shared production adapter must be configured with `configureSessionStore` before using `getSessionManager`. If it is absent, session access throws rather than falling back to process-local memory. The adapter must provide shared persistence, atomic create/rotate behavior, bounded retention/TTL, and appropriate encryption/access controls. Do not use a process-local map as a production store. Store Cognito tokens only in server-side session data and never log them or put them in the cookie.
+
+The future Cognito authorization-code + PKCE implementation is planned to use `openid-client`; this dependency is not yet wired to a login flow. Session unit tests use an in-memory store defined only in the test file.
