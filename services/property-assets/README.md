@@ -1,6 +1,6 @@
 # Property & Asset Registry Service
 
-The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metadata, and Alembic migrations. Its initial schema contains the `portfolios` table. The published Phase 2 property API remains in `backend/`.
+The service exposes `/health` and owns its PostgreSQL database, SQLAlchemy metadata, and Alembic migrations. Its schema contains the portfolio, site, building, and unit tables. The published Phase 2 property API remains in `backend/`.
 
 ## Internal workload token provider
 
@@ -23,6 +23,19 @@ Configure `ORGANIZATION_ACCESS_URL` as the Organization & Access base URL. `ORGA
 ## Protected portfolio detail
 
 `GET /api/v1/portfolios/{portfolio_id}?organization_id=<UUID>` uses the same user bearer token, workload token, and `property-assets.portfolios.read` organization decision as listing. The path ID and query organization ID are selectors, not proof of access. The service verifies that Organization & Access authorized the requested organization and retrieves the portfolio using both `id` and the authorized `organization_id`. A missing portfolio and a portfolio belonging to another organization both return the same `404` response. Successful responses use the same minimal `PortfolioResponse` contract as the list endpoint.
+
+## Protected property hierarchy
+
+The following read-only endpoints use the same user authentication and `property-assets.portfolios.read` organization decision:
+
+- `GET /api/v1/portfolios/{portfolio_id}/sites?organization_id=<UUID>`
+- `GET /api/v1/portfolios/{portfolio_id}/sites/{site_id}?organization_id=<UUID>`
+- `GET /api/v1/portfolios/{portfolio_id}/sites/{site_id}/buildings?organization_id=<UUID>`
+- `GET /api/v1/portfolios/{portfolio_id}/sites/{site_id}/buildings/{building_id}?organization_id=<UUID>`
+- `GET /api/v1/portfolios/{portfolio_id}/sites/{site_id}/buildings/{building_id}/units?organization_id=<UUID>`
+- `GET /api/v1/portfolios/{portfolio_id}/sites/{site_id}/buildings/{building_id}/units/{unit_id}?organization_id=<UUID>`
+
+Every query is scoped to the authorized organization and supplied parent IDs. Building and unit queries join only Registry-owned tables to verify the full parent chain. Missing and out-of-scope assets return the same `404`. Responses use explicit schemas and contain only fields defined by the Registry models. Organization & Access remains the membership authority; no cross-service database queries are made.
 
 ## Database setup
 
@@ -47,7 +60,7 @@ docker compose --env-file infra/local/.env -f infra/local/compose.yaml run --rm 
 docker compose --env-file infra/local/.env -f infra/local/compose.yaml run --rm property-assets alembic history
 ```
 
-The migration can be reversed with `alembic downgrade base`; this drops the `portfolios` table and should only be used against an explicitly selected disposable database/schema or when intentionally removing the service schema.
+The migration chain creates the portfolio, site, building, and unit tables. It can be reversed with `alembic downgrade base`; this drops the Registry schema and should only be used against an explicitly selected disposable database/schema or when intentionally removing the service schema.
 
 ## Tests
 

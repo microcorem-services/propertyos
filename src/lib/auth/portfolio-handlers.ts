@@ -13,6 +13,7 @@ const JWT_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const TIMESTAMP_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/;
 const PORTFOLIO_STATUSES = new Set(['active', 'inactive']);
+const MAX_ASSETS = 1_000;
 
 export type Portfolio = {
   id: string;
@@ -21,6 +22,51 @@ export type Portfolio = {
   status: 'active' | 'inactive';
   created_at: string;
   updated_at: string;
+};
+
+export type Site = {
+  id: string;
+  organization_id: string;
+  portfolio_id: string;
+  name: string;
+  address: string | null;
+  status: 'active' | 'inactive';
+  created_at: string;
+  updated_at: string;
+};
+
+export type Building = {
+  id: string;
+  organization_id: string;
+  site_id: string;
+  name: string;
+  building_code: string | null;
+  address: string | null;
+  status: 'active' | 'inactive';
+  created_at: string;
+  updated_at: string;
+};
+
+export type Unit = {
+  id: string;
+  organization_id: string;
+  building_id: string;
+  name: string;
+  unit_code: string | null;
+  floor: string | null;
+  area_sqm: string | null;
+  status: 'active' | 'inactive';
+  created_at: string;
+  updated_at: string;
+};
+
+type HierarchyKind = 'site' | 'building' | 'unit';
+type HierarchyAsset = Site | Building | Unit;
+type HierarchyParents = {
+  portfolioId: string;
+  siteId?: string;
+  buildingId?: string;
+  resourceId?: string;
 };
 
 type RetrievedSession = {
@@ -184,6 +230,150 @@ function isValidTimestamp(value: string): boolean {
   );
 }
 
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+function parseHierarchyAsset(
+  value: unknown,
+  kind: HierarchyKind,
+  organizationId: string,
+  parents: HierarchyParents,
+): HierarchyAsset | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const asset = value as Record<string, unknown>;
+  const commonValid =
+    typeof asset.id === 'string' &&
+    UUID_PATTERN.test(asset.id) &&
+    (parents.resourceId === undefined ||
+      asset.id.toLowerCase() === parents.resourceId.toLowerCase()) &&
+    typeof asset.organization_id === 'string' &&
+    asset.organization_id.toLowerCase() === organizationId.toLowerCase() &&
+    typeof asset.name === 'string' &&
+    asset.name.trim().length > 0 &&
+    asset.name.length <= 200 &&
+    typeof asset.status === 'string' &&
+    PORTFOLIO_STATUSES.has(asset.status) &&
+    typeof asset.created_at === 'string' &&
+    isValidTimestamp(asset.created_at) &&
+    typeof asset.updated_at === 'string' &&
+    isValidTimestamp(asset.updated_at);
+  if (!commonValid) return null;
+
+  if (kind === 'site') {
+    const keys = [
+      'id',
+      'organization_id',
+      'portfolio_id',
+      'name',
+      'address',
+      'status',
+      'created_at',
+      'updated_at',
+    ];
+    if (
+      Object.keys(asset).length !== keys.length ||
+      !keys.every((key) => Object.hasOwn(asset, key)) ||
+      typeof asset.portfolio_id !== 'string' ||
+      asset.portfolio_id.toLowerCase() !== parents.portfolioId.toLowerCase() ||
+      !isNullableString(asset.address)
+    ) {
+      return null;
+    }
+    return {
+      id: asset.id as string,
+      organization_id: asset.organization_id as string,
+      portfolio_id: asset.portfolio_id,
+      name: asset.name as string,
+      address: asset.address,
+      status: asset.status as Site['status'],
+      created_at: asset.created_at as string,
+      updated_at: asset.updated_at as string,
+    };
+  }
+
+  if (kind === 'building') {
+    const keys = [
+      'id',
+      'organization_id',
+      'site_id',
+      'name',
+      'building_code',
+      'address',
+      'status',
+      'created_at',
+      'updated_at',
+    ];
+    if (
+      Object.keys(asset).length !== keys.length ||
+      !keys.every((key) => Object.hasOwn(asset, key)) ||
+      typeof asset.site_id !== 'string' ||
+      asset.site_id.toLowerCase() !== parents.siteId?.toLowerCase() ||
+      !isNullableString(asset.building_code) ||
+      !isNullableString(asset.address)
+    ) {
+      return null;
+    }
+    return {
+      id: asset.id as string,
+      organization_id: asset.organization_id as string,
+      site_id: asset.site_id,
+      name: asset.name as string,
+      building_code: asset.building_code,
+      address: asset.address,
+      status: asset.status as Building['status'],
+      created_at: asset.created_at as string,
+      updated_at: asset.updated_at as string,
+    };
+  }
+
+  const keys = [
+    'id',
+    'organization_id',
+    'building_id',
+    'name',
+    'unit_code',
+    'floor',
+    'area_sqm',
+    'status',
+    'created_at',
+    'updated_at',
+  ];
+  const area = asset.area_sqm;
+  const areaValid =
+    area === null ||
+    (typeof area === 'number' && Number.isFinite(area) && area > 0) ||
+    (typeof area === 'string' &&
+      /^\d+(?:\.\d+)?$/.test(area) &&
+      Number.isFinite(Number(area)) &&
+      Number(area) > 0);
+  if (
+    Object.keys(asset).length !== keys.length ||
+    !keys.every((key) => Object.hasOwn(asset, key)) ||
+    typeof asset.building_id !== 'string' ||
+    asset.building_id.toLowerCase() !== parents.buildingId?.toLowerCase() ||
+    !isNullableString(asset.unit_code) ||
+    !isNullableString(asset.floor) ||
+    !areaValid
+  ) {
+    return null;
+  }
+  return {
+    id: asset.id as string,
+    organization_id: asset.organization_id as string,
+    building_id: asset.building_id,
+    name: asset.name as string,
+    unit_code: asset.unit_code,
+    floor: asset.floor,
+    area_sqm: area === null ? null : String(area),
+    status: asset.status as Unit['status'],
+    created_at: asset.created_at as string,
+    updated_at: asset.updated_at as string,
+  };
+}
+
 function parsePortfolios(payload: unknown, organizationId: string): Portfolio[] | null {
   if (!Array.isArray(payload) || payload.length > MAX_PORTFOLIOS) return null;
 
@@ -283,6 +473,102 @@ export function createPortfolioHandlers(
   const fetcher = dependencies.fetch ?? fetch;
   const now = dependencies.now ?? Date.now;
 
+  async function getHierarchy(
+    request: Request,
+    path: string,
+    kind: HierarchyKind,
+    collection: boolean,
+    parents: HierarchyParents,
+  ): Promise<Response> {
+    const organizationId = requestedOrganizationId(new URL(request.url));
+    if (
+      !organizationId ||
+      !UUID_PATTERN.test(parents.portfolioId) ||
+      (parents.siteId !== undefined && !UUID_PATTERN.test(parents.siteId)) ||
+      (parents.buildingId !== undefined && !UUID_PATTERN.test(parents.buildingId)) ||
+      (parents.resourceId !== undefined && !UUID_PATTERN.test(parents.resourceId))
+    ) {
+      return errorResponse(400, 'Invalid asset request.');
+    }
+
+    try {
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const upstreamUrl = new URL(path, config.baseUrl);
+      upstreamUrl.searchParams.set('organization_id', organizationId);
+      const upstream = await fetcher(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Organization access denied.');
+      }
+      if (upstream.status === 404) {
+        return errorResponse(404, 'Asset not found.');
+      }
+      if (upstream.status !== 200 || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (!upstream.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+
+      let payload: unknown;
+      try {
+        payload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+
+      if (collection) {
+        if (!Array.isArray(payload) || payload.length > MAX_ASSETS) {
+          return errorResponse(502, 'Invalid Property & Asset Registry response.');
+        }
+        const assets = payload.map((item) =>
+          parseHierarchyAsset(item, kind, organizationId, parents),
+        );
+        if (assets.some((asset) => asset === null)) {
+          return errorResponse(502, 'Invalid Property & Asset Registry response.');
+        }
+        return Response.json(assets, {
+          headers: {
+            'Cache-Control': 'no-store',
+            Pragma: 'no-cache',
+          },
+        });
+      }
+
+      const asset = parseHierarchyAsset(payload, kind, organizationId, parents);
+      if (!asset) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(asset, {
+        headers: {
+          'Cache-Control': 'no-store',
+          Pragma: 'no-cache',
+        },
+      });
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
   return {
     async getPortfolios(request: Request): Promise<Response> {
       const organizationId = requestedOrganizationId(new URL(request.url));
@@ -305,7 +591,7 @@ export function createPortfolioHandlers(
           method: 'GET',
           headers: {
             Accept: 'application/json',
-            Authorization: `Bearer ${accessToken}`,
+            Authorization: 'Bearer ' + accessToken,
           },
           cache: 'no-store',
           redirect: 'manual',
@@ -374,7 +660,7 @@ export function createPortfolioHandlers(
           method: 'GET',
           headers: {
             Accept: 'application/json',
-            Authorization: `Bearer ${accessToken}`,
+            Authorization: 'Bearer ' + accessToken,
           },
           cache: 'no-store',
           redirect: 'manual',
@@ -417,6 +703,84 @@ export function createPortfolioHandlers(
       } catch {
         return errorResponse(503, 'Property service unavailable.');
       }
+    },
+    getSites(request: Request, portfolioId: string): Promise<Response> {
+      return getHierarchy(
+        request,
+        `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}/sites`,
+        'site',
+        true,
+        { portfolioId },
+      );
+    },
+    getSite(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+    ): Promise<Response> {
+      return getHierarchy(
+        request,
+        `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}`,
+        'site',
+        false,
+        { portfolioId, resourceId: siteId },
+      );
+    },
+    getBuildings(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+    ): Promise<Response> {
+      return getHierarchy(
+        request,
+        `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings`,
+        'building',
+        true,
+        { portfolioId, siteId },
+      );
+    },
+    getBuilding(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+      buildingId: string,
+    ): Promise<Response> {
+      return getHierarchy(
+        request,
+        `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings/${encodeURIComponent(buildingId)}`,
+        'building',
+        false,
+        { portfolioId, siteId, resourceId: buildingId },
+      );
+    },
+    getUnits(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+      buildingId: string,
+    ): Promise<Response> {
+      return getHierarchy(
+        request,
+        `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings/${encodeURIComponent(buildingId)}/units`,
+        'unit',
+        true,
+        { portfolioId, siteId, buildingId },
+      );
+    },
+    getUnit(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+      buildingId: string,
+      unitId: string,
+    ): Promise<Response> {
+      return getHierarchy(
+        request,
+        `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings/${encodeURIComponent(buildingId)}/units/${encodeURIComponent(unitId)}`,
+        'unit',
+        false,
+        { portfolioId, siteId, buildingId, resourceId: unitId },
+      );
     },
   };
 }

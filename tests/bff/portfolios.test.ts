@@ -3,7 +3,10 @@ import { test } from 'node:test';
 import {
   createPortfolioHandlers,
   loadPropertyAssetRegistryConfiguration,
+  type Building,
   type Portfolio,
+  type Site,
+  type Unit,
 } from '../../src/lib/auth/portfolio-handlers';
 import { serializeSessionCookie } from '../../src/lib/auth/session';
 
@@ -18,6 +21,39 @@ const portfolio: Portfolio = {
   id: portfolioId,
   organization_id: organizationId,
   name: 'North Estate',
+  status: 'active',
+  created_at: '2026-01-02T03:04:05Z',
+  updated_at: '2026-02-03T04:05:06+00:00',
+};
+const site: Site = {
+  id: '00000000-0000-4000-8000-000000000201',
+  organization_id: organizationId,
+  portfolio_id: portfolioId,
+  name: 'North Grounds',
+  address: 'Example Road',
+  status: 'active',
+  created_at: '2026-01-02T03:04:05Z',
+  updated_at: '2026-02-03T04:05:06+00:00',
+};
+const building: Building = {
+  id: '00000000-0000-4000-8000-000000000301',
+  organization_id: organizationId,
+  site_id: site.id,
+  name: 'Main House',
+  building_code: 'MH',
+  address: null,
+  status: 'active',
+  created_at: '2026-01-02T03:04:05Z',
+  updated_at: '2026-02-03T04:05:06+00:00',
+};
+const unit: Unit = {
+  id: '00000000-0000-4000-8000-000000000401',
+  organization_id: organizationId,
+  building_id: building.id,
+  name: 'Suite 4',
+  unit_code: 'S4',
+  floor: '4',
+  area_sqm: '42.50',
   status: 'active',
   created_at: '2026-01-02T03:04:05Z',
   updated_at: '2026-02-03T04:05:06+00:00',
@@ -412,4 +448,143 @@ test('rejects portfolio detail responses with mismatched IDs or private fields',
     assert.equal(response.status, 502);
     assert.doesNotMatch(await response.text(), /sensitive|subject|accessToken/);
   }
+});
+
+test('lists authorized sites through the Registry and allowlists the site contract', async () => {
+  const context = setup({ response: makeResponse(200, [site]) });
+  const response = await context.handlers.getSites(
+    context.request(
+      `https://app.example/api/portfolios/${portfolioId}/sites?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), [site]);
+  assert.equal(
+    context.requestedUrl()?.href,
+    `https://property-assets.example.test/api/v1/portfolios/${portfolioId}/sites?organization_id=${organizationId}`,
+  );
+  assert.equal(context.requestInit()?.redirect, 'manual');
+  assert.equal(context.requestInit()?.cache, 'no-store');
+});
+
+test('validates all hierarchy selectors and rejects unexpected query parameters', async () => {
+  const invalid = setup();
+  const response = await invalid.handlers.getUnits(
+    invalid.request(
+      `https://app.example/api/portfolios/${portfolioId}/sites/${site.id}/buildings/not-a-uuid/units?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+    site.id,
+    'not-a-uuid',
+  );
+  assert.equal(response.status, 400);
+  assert.equal(invalid.retrieved.length, 0);
+  assert.equal(invalid.calls(), 0);
+
+  const unexpectedQuery = setup();
+  const rejected = await unexpectedQuery.handlers.getSite(
+    unexpectedQuery.request(
+      `https://app.example/api/portfolios/${portfolioId}/sites/${site.id}?organizationId=${organizationId}&extra=1`,
+    ),
+    portfolioId,
+    site.id,
+  );
+  assert.equal(rejected.status, 400);
+  assert.equal(unexpectedQuery.calls(), 0);
+});
+
+test('forwards live server session to parent-scoped building and unit endpoints', async () => {
+  const buildingContext = setup({ response: makeResponse(200, [building]) });
+  const buildingResponse = await buildingContext.handlers.getBuildings(
+    buildingContext.request(
+      `https://app.example/api/portfolios/${portfolioId}/sites/${site.id}/buildings?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+    site.id,
+  );
+  assert.equal(buildingResponse.status, 200);
+  assert.deepEqual(await buildingResponse.json(), [building]);
+  assert.equal(
+    buildingContext.requestedUrl()?.pathname,
+    `/api/v1/portfolios/${portfolioId}/sites/${site.id}/buildings`,
+  );
+
+  const unitContext = setup({ response: makeResponse(200, unit) });
+  const unitResponse = await unitContext.handlers.getUnit(
+    unitContext.request(
+      `https://app.example/api/portfolios/${portfolioId}/sites/${site.id}/buildings/${building.id}/units/${unit.id}?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+    site.id,
+    building.id,
+    unit.id,
+  );
+  assert.equal(unitResponse.status, 200);
+  assert.deepEqual(await unitResponse.json(), unit);
+  assert.equal(
+    unitContext.requestedUrl()?.pathname,
+    `/api/v1/portfolios/${portfolioId}/sites/${site.id}/buildings/${building.id}/units/${unit.id}`,
+  );
+  const authorization = new Headers(unitContext.requestInit()?.headers).get('Authorization');
+  assert.equal(authorization?.startsWith('Bearer '), true);
+  assert.equal(authorization?.endsWith(accessToken), true);
+});
+
+test('rejects cross-parent and malformed hierarchy responses and sanitizes errors', async () => {
+  for (const payload of [
+    { ...site, portfolio_id: '00000000-0000-4000-8000-000000000099' },
+    { ...site, organization_id: '00000000-0000-4000-8000-000000000099' },
+    { ...site, private_field: 'customer data' },
+  ]) {
+    const context = setup({ response: makeResponse(200, [payload]) });
+    const response = await context.handlers.getSites(
+      context.request(
+        `https://app.example/api/portfolios/${portfolioId}/sites?organizationId=${organizationId}`,
+      ),
+      portfolioId,
+    );
+    assert.equal(response.status, 502);
+    assert.doesNotMatch(await response.text(), /customer data/);
+  }
+
+  for (const [status, expected] of [
+    [401, 401],
+    [403, 403],
+    [404, 404],
+    [302, 503],
+    [500, 503],
+  ]) {
+    const context = setup({
+      response: makeResponse(status, { error: 'internal token and customer data' }),
+    });
+    const response = await context.handlers.getBuilding(
+      context.request(
+        `https://app.example/api/portfolios/${portfolioId}/sites/${site.id}/buildings/${building.id}?organizationId=${organizationId}`,
+      ),
+      portfolioId,
+      site.id,
+      building.id,
+    );
+    assert.equal(response.status, expected);
+    assert.doesNotMatch(await response.text(), /internal token|customer data/);
+  }
+
+  const expired = setup({
+    session: {
+      data: {
+        accessToken,
+        accessTokenExpiresAt: String(now),
+      },
+    },
+  });
+  const response = await expired.handlers.getSites(
+    expired.request(
+      `https://app.example/api/portfolios/${portfolioId}/sites?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+  );
+  assert.equal(response.status, 401);
+  assert.equal(expired.calls(), 0);
 });
