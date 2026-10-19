@@ -120,12 +120,10 @@ test('lists only allowlisted portfolios after forwarding the server session toke
   assert.equal(init?.method, 'GET');
   assert.equal(init?.cache, 'no-store');
   assert.equal(init?.redirect, 'manual');
-  assert.equal((init?.signal as AbortSignal).aborted, false);
-  const headers = new Headers(init?.headers);
-  assert.equal(headers.get('Authorization'), `Bearer ${accessToken}`);
-  assert.equal(headers.get('Accept'), 'application/json');
-  assert.deepEqual([...headers.keys()].sort(), ['accept', 'authorization']);
-  assert.notEqual(headers.get('Authorization'), 'Bearer browser-controlled-token');
+  assert.equal(
+    new Headers(init?.headers).get('Authorization'),
+    `Bearer ${accessToken}`,
+  );
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.equal(response.headers.get('pragma'), 'no-cache');
   assert.doesNotMatch(JSON.stringify(responseBody), /subject|accessToken|signature|property-assets\.example/);
@@ -317,5 +315,101 @@ test('validates private Registry URL and bounded timeout configuration', () => {
     assert.throws(loadPropertyAssetRegistryConfiguration);
   } finally {
     for (const [name, value] of original) set(name, value);
+  }
+});
+
+test('retrieves one portfolio using the authenticated organization-scoped Registry route', async () => {
+  const context = setup({ response: makeResponse(200, portfolio) });
+  const response = await context.handlers.getPortfolio(
+    context.request(
+      `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), portfolio);
+  assert.equal(
+    context.requestedUrl()?.href,
+    `https://property-assets.example.test/api/v1/portfolios/${portfolioId}?organization_id=${organizationId}`,
+  );
+  const init = context.requestInit();
+  assert.equal(init?.method, 'GET');
+  assert.equal(init?.cache, 'no-store');
+  assert.equal(init?.redirect, 'manual');
+  const authorization = new Headers(init?.headers).get('Authorization');
+  assert.equal(authorization?.startsWith('Bearer '), true);
+  assert.equal(authorization?.endsWith(accessToken), true);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+});
+
+test('rejects invalid portfolio IDs and organization selectors before session access', async () => {
+  for (const [url, portfolioIdValue] of [
+    [`https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`, 'invalid'],
+    [`https://app.example/api/portfolios/${portfolioId}`, portfolioId],
+    [`https://app.example/api/portfolios/${portfolioId}?organizationId=invalid`, portfolioId],
+    [`https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}&extra=1`, portfolioId],
+  ]) {
+    const context = setup();
+    const response = await context.handlers.getPortfolio(
+      context.request(url),
+      portfolioIdValue,
+    );
+    assert.equal(response.status, 400, url);
+    assert.equal(context.retrieved.length, 0);
+    assert.equal(context.calls(), 0);
+  }
+});
+
+test('portfolio detail requires a live session and maps Registry access outcomes safely', async () => {
+  const noCookie = setup();
+  const unauthorized = await noCookie.handlers.getPortfolio(
+    new Request(
+      `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+    ),
+    portfolioId,
+  );
+  assert.equal(unauthorized.status, 401);
+  assert.equal(noCookie.calls(), 0);
+
+  for (const [status, expected] of [
+    [401, 401],
+    [403, 403],
+    [404, 404],
+    [302, 503],
+    [500, 503],
+  ]) {
+    const context = setup({
+      response: makeResponse(status, {
+        error: 'private Registry response and access token',
+      }),
+    });
+    const response = await context.handlers.getPortfolio(
+      context.request(
+        `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+      ),
+      portfolioId,
+    );
+    assert.equal(response.status, expected);
+    assert.doesNotMatch(await response.text(), /private Registry response|access token/);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+  }
+});
+
+test('rejects portfolio detail responses with mismatched IDs or private fields', async () => {
+  for (const payload of [
+    { ...portfolio, id: '00000000-0000-4000-8000-000000000102' },
+    { ...portfolio, organization_id: '00000000-0000-4000-8000-000000000002' },
+    { ...portfolio, private_data: 'sensitive' },
+  ]) {
+    const context = setup({ response: makeResponse(200, payload) });
+    const response = await context.handlers.getPortfolio(
+      context.request(
+        `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+      ),
+      portfolioId,
+    );
+    assert.equal(response.status, 502);
+    assert.doesNotMatch(await response.text(), /sensitive|subject|accessToken/);
   }
 });

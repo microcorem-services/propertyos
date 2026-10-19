@@ -45,6 +45,23 @@ class FakeSession:
             raise self.error
         return SimpleNamespace(all=lambda: self.portfolios)
 
+    def scalar(self, statement):
+        self.statements.append(statement)
+        if self.error is not None:
+            raise self.error
+        params = statement.compile().params
+        portfolio_id = params["id_1"]
+        organization_id = params["organization_id_1"]
+        return next(
+            (
+                portfolio
+                for portfolio in self.portfolios
+                if portfolio.id == portfolio_id
+                and portfolio.organization_id == organization_id
+            ),
+            None,
+        )
+
 
 @pytest.fixture
 def portfolios_client(monkeypatch):
@@ -131,6 +148,122 @@ def test_authorized_request_returns_minimal_typed_portfolio_fields(
     )
     assert request["timeout"].connect == 1.5
     assert request["timeout"].read == 2.5
+
+
+def test_authorized_portfolio_detail_is_scoped_to_id_and_authorized_organization(
+    monkeypatch, portfolios_client
+):
+    client, session = portfolios_client
+    now = datetime.now(UTC)
+    portfolio = SimpleNamespace(
+        id=uuid4(),
+        organization_id=ORGANIZATION_ID,
+        name="Fictional Portfolio",
+        status="active",
+        created_at=now,
+        updated_at=now,
+    )
+    session.portfolios = [portfolio]
+    monkeypatch.setattr(authorization.httpx, "post", lambda *args, **kwargs: valid_decision())
+
+    response = client.get(
+        f"/api/v1/portfolios/{portfolio.id}",
+        params={"organization_id": str(ORGANIZATION_ID)},
+        headers=get_request_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": str(portfolio.id),
+        "organization_id": str(ORGANIZATION_ID),
+        "name": "Fictional Portfolio",
+        "status": "active",
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "updated_at": now.isoformat().replace("+00:00", "Z"),
+    }
+    assert len(session.statements) == 1
+    assert "portfolios.id = :id_1" in str(session.statements[0])
+    assert "portfolios.organization_id = :organization_id_1" in str(
+        session.statements[0]
+    )
+
+
+def test_portfolio_from_another_organization_is_indistinguishable_from_missing(
+    monkeypatch, portfolios_client
+):
+    client, session = portfolios_client
+    other_organization_portfolio = SimpleNamespace(
+        id=uuid4(),
+        organization_id=uuid4(),
+        name="Private Portfolio",
+        status="active",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    session.portfolios = [other_organization_portfolio]
+    monkeypatch.setattr(authorization.httpx, "post", lambda *args, **kwargs: valid_decision())
+    response = client.get(
+        f"/api/v1/portfolios/{other_organization_portfolio.id}",
+        params={"organization_id": str(ORGANIZATION_ID)},
+        headers=get_request_headers(),
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Portfolio not found"
+    assert len(session.statements) == 1
+
+
+def test_invalid_portfolio_id_is_rejected_before_database_query(
+    portfolios_client, monkeypatch
+):
+    client, session = portfolios_client
+    monkeypatch.setattr(
+        authorization.httpx,
+        "post",
+        lambda *args, **kwargs: valid_decision(),
+    )
+    response = client.get(
+        "/api/v1/portfolios/not-a-uuid",
+        params={"organization_id": str(ORGANIZATION_ID)},
+        headers=get_request_headers(),
+    )
+    assert response.status_code == 422
+    assert session.statements == []
+
+
+def test_portfolio_detail_requires_organization_authorization(
+    monkeypatch, portfolios_client
+):
+    client, session = portfolios_client
+    monkeypatch.setattr(
+        authorization.httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(403),
+    )
+    response = client.get(
+        f"/api/v1/portfolios/{uuid4()}",
+        params={"organization_id": str(ORGANIZATION_ID)},
+        headers=get_request_headers(),
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+    assert session.statements == []
+
+
+def test_portfolio_detail_database_error_is_sanitized(monkeypatch, portfolios_client):
+    client, session = portfolios_client
+    session.error = OperationalError(
+        "SELECT portfolios",
+        {},
+        Exception("fictional database failure secret"),
+    )
+    monkeypatch.setattr(authorization.httpx, "post", lambda *args, **kwargs: valid_decision())
+    response = client.get(
+        f"/api/v1/portfolios/{uuid4()}",
+        params={"organization_id": str(ORGANIZATION_ID)},
+        headers=get_request_headers(),
+    )
+    assert response.status_code == 503
+    assert "fictional database failure secret" not in response.text
 
 
 @pytest.mark.parametrize(

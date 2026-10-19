@@ -1,7 +1,7 @@
 from collections.abc import Generator
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -123,3 +123,28 @@ def list_portfolios(
         raise PropertyDatabaseUnavailable from None
 
     return portfolios
+
+
+@api_router.get("/portfolios/{portfolio_id}", response_model=PortfolioResponse)
+def get_portfolio(
+    portfolio_id: UUID,
+    organization_id: UUID,
+    _authorization: AuthorizedOrganization = Depends(get_authorized_organization),
+    session: Session = Depends(get_portfolio_session),
+):
+    if _authorization.organization_id != organization_id:
+        raise AuthorizationDependencyUnavailable
+
+    try:
+        portfolio = session.scalar(
+            select(Portfolio).where(
+                Portfolio.id == portfolio_id,
+                Portfolio.organization_id == _authorization.organization_id,
+            )
+        )
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
+
+    if portfolio is None:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    return portfolio

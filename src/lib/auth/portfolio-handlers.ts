@@ -118,6 +118,32 @@ function requestedOrganizationId(requestUrl: URL): string | null {
   return values[0];
 }
 
+async function readAccessToken(
+  request: Request,
+  sessions: () => PortfolioSessionManager,
+  now: () => number,
+): Promise<string | null> {
+  const sessionId = readSessionCookie(request.headers.get('cookie'));
+  if (!sessionId) return null;
+
+  const session = await sessions().retrieve(sessionId);
+  if (!session) return null;
+
+  const accessToken = session.data.accessToken;
+  const expiresAtValue = session.data.accessTokenExpiresAt;
+  if (
+    typeof accessToken !== 'string' ||
+    !JWT_PATTERN.test(accessToken) ||
+    typeof expiresAtValue !== 'string' ||
+    !/^[1-9]\d*$/.test(expiresAtValue)
+  ) {
+    return null;
+  }
+  const expiresAt = Number(expiresAtValue);
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now()) return null;
+  return accessToken;
+}
+
 function isValidTimestamp(value: string): boolean {
   const match = TIMESTAMP_PATTERN.exec(value);
   if (!match) return false;
@@ -264,27 +290,13 @@ export function createPortfolioHandlers(
         return errorResponse(400, 'Invalid portfolio listing request.');
       }
 
-      const sessionId = readSessionCookie(request.headers.get('cookie'));
-      if (!sessionId) return errorResponse(401, 'Authentication required.');
-
       try {
-        const session = await dependencies.sessions().retrieve(sessionId);
-        if (!session) return errorResponse(401, 'Authentication required.');
-
-        const accessToken = session.data.accessToken;
-        const expiresAtValue = session.data.accessTokenExpiresAt;
-        if (
-          typeof accessToken !== 'string' ||
-          !JWT_PATTERN.test(accessToken) ||
-          typeof expiresAtValue !== 'string' ||
-          !/^[1-9]\d*$/.test(expiresAtValue)
-        ) {
-          return errorResponse(401, 'Authentication required.');
-        }
-        const expiresAt = Number(expiresAtValue);
-        if (!Number.isSafeInteger(expiresAt) || expiresAt <= now()) {
-          return errorResponse(401, 'Authentication required.');
-        }
+        const accessToken = await readAccessToken(
+          request,
+          dependencies.sessions,
+          now,
+        );
+        if (!accessToken) return errorResponse(401, 'Authentication required.');
 
         const config = configuration();
         const upstreamUrl = new URL(PORTFOLIOS_PATH, config.baseUrl);
@@ -325,6 +337,78 @@ export function createPortfolioHandlers(
         }
 
         return Response.json(portfolios, {
+          headers: {
+            'Cache-Control': 'no-store',
+            Pragma: 'no-cache',
+          },
+        });
+      } catch {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+    },
+    async getPortfolio(
+      request: Request,
+      portfolioId: string,
+    ): Promise<Response> {
+      const requestUrl = new URL(request.url);
+      const organizationId = requestedOrganizationId(requestUrl);
+      if (!organizationId || !UUID_PATTERN.test(portfolioId)) {
+        return errorResponse(400, 'Invalid portfolio detail request.');
+      }
+
+      try {
+        const accessToken = await readAccessToken(
+          request,
+          dependencies.sessions,
+          now,
+        );
+        if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+        const config = configuration();
+        const upstreamUrl = new URL(
+          `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}`,
+          config.baseUrl,
+        );
+        upstreamUrl.searchParams.set('organization_id', organizationId);
+        const upstream = await fetcher(upstreamUrl, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+          },
+          cache: 'no-store',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(config.timeoutMs),
+        });
+
+        if (upstream.status === 401) {
+          return errorResponse(401, 'Authentication required.');
+        }
+        if (upstream.status === 403) {
+          return errorResponse(403, 'Organization access denied.');
+        }
+        if (upstream.status === 404) {
+          return errorResponse(404, 'Portfolio not found.');
+        }
+        if (upstream.status !== 200 || upstream.redirected) {
+          return errorResponse(503, 'Property service unavailable.');
+        }
+        if (!upstream.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+          return errorResponse(502, 'Invalid Property & Asset Registry response.');
+        }
+
+        let payload: unknown;
+        try {
+          payload = await readPortfolioPayload(upstream);
+        } catch {
+          return errorResponse(502, 'Invalid Property & Asset Registry response.');
+        }
+        const portfolios = parsePortfolios([payload], organizationId);
+        if (!portfolios || portfolios[0].id.toLowerCase() !== portfolioId.toLowerCase()) {
+          return errorResponse(502, 'Invalid Property & Asset Registry response.');
+        }
+
+        return Response.json(portfolios[0], {
           headers: {
             'Cache-Control': 'no-store',
             Pragma: 'no-cache',

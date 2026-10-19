@@ -20,6 +20,10 @@ Production token endpoints must use HTTPS. The provider sends a Basic client-aut
 
 Configure `ORGANIZATION_ACCESS_URL` as the Organization & Access base URL. `ORGANIZATION_ACCESS_CONNECT_TIMEOUT_SECONDS` and `ORGANIZATION_ACCESS_READ_TIMEOUT_SECONDS` are positive bounded timeouts in seconds (defaults: 2 and 3). HTTPS is required except when `ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP=true`; even then, HTTP is limited to `localhost` or a loopback IP. Missing configuration, unexpected service responses, and transport failures return sanitized `503`; invalid user credentials return `401`, and an explicit authorization denial returns `403`. Portfolio queries include the authorized `organization_id` predicate.
 
+## Protected portfolio detail
+
+`GET /api/v1/portfolios/{portfolio_id}?organization_id=<UUID>` uses the same user bearer token, workload token, and `property-assets.portfolios.read` organization decision as listing. The path ID and query organization ID are selectors, not proof of access. The service verifies that Organization & Access authorized the requested organization and retrieves the portfolio using both `id` and the authorized `organization_id`. A missing portfolio and a portfolio belonging to another organization both return the same `404` response. Successful responses use the same minimal `PortfolioResponse` contract as the list endpoint.
+
 ## Database setup
 
 Set `DATABASE_URL` to a synchronous PostgreSQL SQLAlchemy URL for the dedicated Property & Asset Registry database. The local Compose configuration uses the separate `bowera_property_assets` database and `property-assets-data` volume. Do not configure this service with the Phase 2 or Organization & Access database.

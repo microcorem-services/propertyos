@@ -33,6 +33,29 @@ export function parsePortfolioOrganizationId(search: string): string | null {
     : null;
 }
 
+export function portfolioDetailHref(
+  portfolioId: string,
+  organizationId: string,
+): string {
+  if (!UUID_PATTERN.test(portfolioId) || !UUID_PATTERN.test(organizationId)) {
+    throw new TypeError('Invalid portfolio detail URL.');
+  }
+  return `/portfolio/${encodeURIComponent(portfolioId)}?organizationId=${encodeURIComponent(organizationId)}`;
+}
+
+export function parsePortfolio(
+  payload: unknown,
+  organizationId: string,
+  portfolioId: string,
+): Portfolio {
+  const portfolios = parsePortfolios([payload], organizationId);
+  const portfolio = portfolios[0];
+  if (!portfolio || portfolio.id.toLowerCase() !== portfolioId.toLowerCase()) {
+    throw new TypeError('Invalid portfolio response.');
+  }
+  return portfolio;
+}
+
 function parsePortfolios(payload: unknown, organizationId: string): Portfolio[] {
   if (!Array.isArray(payload) || payload.length > MAX_PORTFOLIOS) {
     throw new TypeError('Invalid portfolios response.');
@@ -132,6 +155,67 @@ export async function fetchPortfolios(
 
   try {
     return parsePortfolios(await response.json(), organizationId);
+  } catch {
+    throw new PortfoliosRequestError(
+      'The portfolio response could not be verified.',
+      502,
+    );
+  }
+}
+
+export async function fetchPortfolio(
+  portfolioId: string,
+  organizationId: string,
+  signal?: AbortSignal,
+): Promise<Portfolio> {
+  if (!UUID_PATTERN.test(portfolioId) || !UUID_PATTERN.test(organizationId)) {
+    throw new PortfoliosRequestError('Choose a valid portfolio first.', 400);
+  }
+
+  let response: Response;
+  try {
+    const params = new URLSearchParams({ organizationId });
+    response = await fetch(
+      `/api/portfolios/${encodeURIComponent(portfolioId)}?${params.toString()}`,
+      {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'error',
+        headers: { Accept: 'application/json' },
+        signal,
+      },
+    );
+  } catch {
+    throw new PortfoliosRequestError(
+      'Portfolio details could not be reached. Please try again.',
+      0,
+    );
+  }
+
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have access to this organisation.',
+      403,
+    );
+  }
+  if (response.status === 404) {
+    throw new PortfoliosRequestError('Portfolio not found.', 404);
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      response.status === 503
+        ? 'The portfolio service is temporarily unavailable. Please try again.'
+        : 'Portfolio details could not be loaded. Please try again.',
+      response.status,
+    );
+  }
+
+  try {
+    return parsePortfolio(await response.json(), organizationId, portfolioId);
   } catch {
     throw new PortfoliosRequestError(
       'The portfolio response could not be verified.',

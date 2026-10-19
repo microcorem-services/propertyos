@@ -781,6 +781,8 @@
   border-radius: 3px;
   background: #ffffff;
   box-shadow: 0 10px 34px rgb(16 61 50 / 5%);
+  color: inherit;
+  text-decoration: none;
   transition:
     border-color 180ms ease,
     box-shadow 180ms ease,
@@ -791,6 +793,11 @@
   transform: translateY(-2px);
   border-color: rgb(16 61 50 / 35%);
   box-shadow: 0 16px 40px rgb(16 61 50 / 9%);
+}
+
+.bowera-portfolio-card:focus-visible {
+  outline: 3px solid var(--bow-era-focus);
+  outline-offset: 3px;
 }
 
 .bowera-portfolio-card-top {
@@ -955,5 +962,141 @@
 
   .bowera-portfolio-name {
     font-size: 22px;
+  }
+}
+
+.bowera-detail-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 36px;
+  color: var(--bow-era-muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.bowera-detail-breadcrumb a {
+  color: var(--bow-era-green);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: rgb(16 61 50 / 30%);
+  text-underline-offset: 4px;
+}
+
+.bowera-detail-breadcrumb a:hover {
+  text-decoration-color: var(--bow-era-green);
+}
+
+.bowera-detail-heading-row {
+  margin-bottom: 44px;
+}
+
+.bowera-detail-heading-row .bow-era-title {
+  overflow-wrap: anywhere;
+}
+
+.bowera-detail-card {
+  max-width: 960px;
+  padding: clamp(26px, 4vw, 52px);
+  border: 1px solid #e6eae7;
+  background: #ffffff;
+  box-shadow: 0 16px 48px rgb(16 61 50 / 6%);
+}
+
+.bowera-detail-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid #edf0ed;
+}
+
+.bowera-detail-card-top .bow-era-eyebrow {
+  margin: 0;
+}
+
+.bowera-detail-name {
+  margin: 30px 0 38px;
+  color: var(--bow-era-green);
+  font-family: var(--font-plus-jakarta), sans-serif;
+  font-size: clamp(27px, 4vw, 40px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.bowera-detail-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-top: 1px solid #edf0ed;
+  border-left: 1px solid #edf0ed;
+}
+
+.bowera-detail-list > div {
+  min-width: 0;
+  padding: 22px;
+  border-right: 1px solid #edf0ed;
+  border-bottom: 1px solid #edf0ed;
+}
+
+.bowera-detail-list dt {
+  margin-bottom: 9px;
+  color: var(--bow-era-muted);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.bowera-detail-list dd {
+  margin: 0;
+  color: var(--bow-era-charcoal);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.bowera-detail-list code {
+  color: var(--bow-era-green);
+  font-family: var(--font-manrope), sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+@media (max-width: 680px) {
+  .bowera-detail-breadcrumb {
+    gap: 8px;
+    margin-bottom: 28px;
+    font-size: 13px;
+  }
+
+  .bowera-detail-heading-row {
+    margin-bottom: 32px;
+  }
+
+  .bowera-detail-card {
+    padding: 23px 19px;
+  }
+
+  .bowera-detail-card-top {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+    padding-bottom: 19px;
+  }
+
+  .bowera-detail-name {
+    margin: 24px 0 28px;
+  }
+
+  .bowera-detail-list {
+    grid-template-columns: 1fr;
+  }
+
+  .bowera-detail-list > div {
+    padding: 17px;
   }
 }

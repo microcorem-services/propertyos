@@ -12,6 +12,7 @@ import {
 import {
   fetchPortfolios,
   parsePortfolioOrganizationId,
+  portfolioDetailHref,
   PortfoliosRequestError,
   type Portfolio,
 } from '@/lib/portfolios/client';
@@ -31,7 +32,11 @@ function formatDate(value: string): string {
 
 function PortfolioCard({ portfolio }: { portfolio: Portfolio }) {
   return (
-    <article className="bowera-portfolio-card">
+    <Link
+      aria-label={`View ${portfolio.name} portfolio details`}
+      className="bowera-portfolio-card"
+      href={portfolioDetailHref(portfolio.id, portfolio.organization_id)}
+    >
       <div className="bowera-portfolio-card-top">
         <span
           className={`bowera-portfolio-status bowera-portfolio-status-${portfolio.status}`}
@@ -60,7 +65,7 @@ function PortfolioCard({ portfolio }: { portfolio: Portfolio }) {
           </dd>
         </div>
       </dl>
-    </article>
+    </Link>
   );
 }
 
