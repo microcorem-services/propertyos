@@ -8,21 +8,25 @@ Database sessions are provided by the `get_db` dependency in `app/database.py`. 
 
 Organization status values are `active` and `suspended`. Membership roles are `owner`, `admin`, and `member`; membership statuses are `invited`, `active`, and `suspended`. These values are stored as strings and checked by database constraints, but do not implement authorization. Timestamps use timezone-aware columns with UTC defaults.
 
-Authentication, authorization, audit events, and public CRUD endpoints are not implemented.
+Audit events and public CRUD endpoints are not implemented.
 
 ## API foundation and future routes
 
-Versioned API routes will use `/api/v1`. The prefix is reserved in the application, but there are currently no database-backed API routes. `/health` and `/ready` remain unversioned operational endpoints.
+Versioned API routes use `/api/v1`. `/health` and `/ready` remain unversioned operational endpoints.
 
-Pydantic response schemas define the current organization, user, and membership response shapes. API errors are intended to use an `error` object containing a stable `code` and human-readable `message`. These schemas do not expose data by themselves.
+Pydantic response schemas define the current organization, user, and membership response shapes. API errors use an `error` object containing a stable `code` and human-readable `message`. These schemas do not expose data by themselves.
 
-Proposed read-only endpoints, to be added only with authentication and authorization:
+### Protected organization detail
 
-- `GET /api/v1/organizations` and `GET /api/v1/organizations/{organization_id}` — require an authenticated identity and organization-scoped authorization.
+`GET /api/v1/organizations/{organization_id}` returns the public organization fields `id`, `name`, `status`, `created_at`, and `updated_at`. The caller must provide a valid Cognito access token and have an active membership in the explicitly requested active organization. Invalid UUIDs return `422`; authentication failures return `401`; missing, inactive, or mismatched memberships return a generic `403`; database failures return a sanitized `503`. The response excludes users, memberships, and internal database details.
+
+Other proposed read-only endpoints, to be added only with authentication and authorization:
+
+- `GET /api/v1/organizations` — requires an authenticated identity and organization-scoped authorization.
 - `GET /api/v1/users/me` — require authentication and may return only the caller's own user profile.
 - `GET /api/v1/organizations/{organization_id}/memberships` — require authentication plus authorization to view membership data for that organization.
 
-There are no create, update, or delete endpoints. No unauthenticated caller may retrieve organization, user, or membership records. Authentication, membership checks, and role-based policy must be implemented and reviewed before any of these routes are exposed.
+There are no create, update, or delete endpoints. No unauthenticated caller may retrieve organization, user, or membership records. Authentication, membership checks, and any role-based policy must be implemented and reviewed before additional routes are exposed.
 
 ## Cognito access-token verification foundation
 
@@ -30,13 +34,13 @@ The reusable `verify_access_token` dependency in `app/auth.py` verifies Cognito 
 
 Verification accepts RS256 only and validates the signature, issuer, expiry, required token claims, `token_use=access`, client ID, and required scope. It does not accept Cognito ID tokens or grant access based on authentication alone. Missing, malformed, expired, incorrectly signed, wrong-issuer, wrong-client, and insufficient-scope tokens receive the same `401` error envelope. JWKS retrieval is lazy and uses a five-second timeout. Missing or invalid server configuration fails closed with `503`; no placeholder identity is created.
 
-The expected deployment boundary is a Next.js BFF using Authorization Code with PKCE, which forwards the Cognito access token to this API. This milestone does not implement login, token issuance, browser token storage, the BFF, or organization authorization. A verified identity still has no organization or tenant access until a separate authorization layer checks it.
+The expected deployment boundary is a Next.js BFF using Authorization Code with PKCE, which forwards the Cognito access token to this API. This service does not implement login, token issuance, browser token storage, or the BFF. Token verification alone does not grant organization or tenant access; protected organization routes also require a separate membership authorization check.
 
 ## Organization membership authorization foundation
 
 `require_organization_membership()` in `app/authorization.py` is the reusable authorization dependency for future organization-scoped routes. Routes must supply an explicit `organization_id` path parameter; the dependency obtains identity only from `verify_access_token`, resolves the token's `sub` to `users.external_subject`, and checks that the organization and matching membership are active. Callers may supply an explicit set of permitted `MembershipRole` values for an operation; no administrator role is granted by default.
 
-Successful authorization returns only an `AuthorizedMembership` context. Missing users or memberships, suspended records, role mismatches, and database lookup/configuration failures return the same `403` response and reveal no organization data. Authentication proves the Cognito identity; membership authorization separately limits that identity to an active, explicitly requested organization. These helpers do not expose endpoints or manage memberships.
+Successful authorization returns only an `AuthorizedMembership` context. Missing users or memberships, suspended records, and role mismatches return the same `403` response. Database lookup/configuration failures return a sanitized `503` and never grant access. Authentication proves the Cognito identity; membership authorization separately limits that identity to an active, explicitly requested organization. These helpers do not manage memberships.
 
 ## Database migrations
 

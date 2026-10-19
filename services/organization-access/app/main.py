@@ -1,15 +1,26 @@
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app import database
 from app.auth import AuthenticationConfigurationError, AuthenticationFailure
-from app.authorization import AuthorizationDenied, AuthorizationServiceUnavailable
+from app.authorization import (
+    AuthorizationDenied,
+    AuthorizationServiceUnavailable,
+    AuthorizedMembership,
+    get_authorization_session,
+    require_organization_membership,
+)
 from app.config import SERVICE_NAME
-from app.schemas import APIErrorResponse
+from app.models import Organization, OrganizationStatus
+from app.schemas import APIErrorResponse, OrganizationResponse
 
 API_V1_PREFIX = "/api/v1"
+_organization_membership_dependency = require_organization_membership()
 
 app = FastAPI(title="BOWERA Organization & Access", version="0.1.0")
 api_router = APIRouter(prefix=API_V1_PREFIX)
@@ -83,3 +94,31 @@ def readiness():
         raise HTTPException(status_code=503, detail="Database unavailable") from error
 
     return {"status": "ok", "service": SERVICE_NAME}
+
+
+@api_router.get(
+    "/organizations/{organization_id}",
+    response_model=OrganizationResponse,
+)
+def get_organization(
+    organization_id: UUID,
+    _membership: AuthorizedMembership = Depends(_organization_membership_dependency),
+    session: Session = Depends(get_authorization_session),
+) -> Organization:
+    if _membership.organization_id != organization_id:
+        raise AuthorizationDenied
+
+    try:
+        organization = session.scalar(
+            select(Organization).where(
+                Organization.id == organization_id,
+                Organization.status == OrganizationStatus.ACTIVE.value,
+            )
+        )
+    except SQLAlchemyError as error:
+        raise AuthorizationServiceUnavailable from error
+
+    if organization is None:
+        raise AuthorizationDenied
+
+    return organization

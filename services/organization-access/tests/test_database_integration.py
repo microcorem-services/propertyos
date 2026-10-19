@@ -1,19 +1,25 @@
 import ipaddress
+import json
 import os
 import re
 import subprocess
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
+from jwt import PyJWKClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import Engine, URL
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
+from app import auth, config
 from app import database
 from app.auth import AuthenticatedPrincipal, verify_access_token
 from app.authorization import (
@@ -24,8 +30,10 @@ from app.authorization import (
     require_organization_membership,
 )
 from app.main import (
+    app,
     authorization_denied_handler,
     authorization_service_unavailable_handler,
+    _organization_membership_dependency,
 )
 from app.models import (
     Membership,
@@ -41,6 +49,9 @@ SERVICE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = SERVICE_ROOT.parents[1]
 LOCAL_ENV_FILE = REPOSITORY_ROOT / "infra" / "local" / ".env"
 EXPECTED_DATABASE = "bowera_org_access"
+TEST_ISSUER = "https://cognito-idp.eu-west-1.amazonaws.com/eu-west-1_testpool"
+TEST_CLIENT_ID = "fictional-cognito-client"
+TEST_REQUIRED_SCOPE = "organization-access/read"
 
 
 def _read_local_environment() -> dict[str, str]:
@@ -470,6 +481,233 @@ def create_member(
     session.add(membership)
     session.flush()
     return organization, user, membership
+
+
+@pytest.fixture
+def organization_api_client(monkeypatch, session: Session):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    jwk.update({"kid": "local-integration-key", "use": "sig", "alg": "RS256"})
+    jwks_client = PyJWKClient(f"{TEST_ISSUER}/.well-known/jwks.json", timeout=5)
+    monkeypatch.setattr(jwks_client, "fetch_data", lambda: {"keys": [jwk]})
+    monkeypatch.setattr(auth, "get_jwks_client", lambda: jwks_client)
+    monkeypatch.setattr(config, "COGNITO_ISSUER", TEST_ISSUER)
+    monkeypatch.setattr(config, "COGNITO_USER_POOL_REGION", "eu-west-1")
+    monkeypatch.setattr(config, "COGNITO_APP_CLIENT_ID", TEST_CLIENT_ID)
+    monkeypatch.setattr(config, "COGNITO_REQUIRED_SCOPE", TEST_REQUIRED_SCOPE)
+
+    def provide_session():
+        yield session
+
+    monkeypatch.setitem(
+        app.dependency_overrides, get_authorization_session, provide_session
+    )
+    client = TestClient(app)
+
+    def make_token(subject: str = "fictional-cognito-subject") -> str:
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "iss": TEST_ISSUER,
+                "sub": subject,
+                "client_id": TEST_CLIENT_ID,
+                "token_use": "access",
+                "scope": TEST_REQUIRED_SCOPE,
+                "iat": now,
+                "exp": now + timedelta(minutes=5),
+            },
+            private_key,
+            algorithm="RS256",
+            headers={"kid": "local-integration-key"},
+        )
+
+    return client, make_token
+
+
+def _organization_headers(make_token: Callable[..., str], subject: str | None = None):
+    token = make_token() if subject is None else make_token(subject)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_organization_endpoint_returns_only_public_fields(
+    session: Session, organization_api_client
+):
+    organization, _, _ = create_member(session)
+    client, make_token = organization_api_client
+
+    response = client.get(
+        f"/api/v1/organizations/{organization.id}",
+        headers=_organization_headers(make_token),
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()) == {
+        "id",
+        "name",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+    assert response.json()["id"] == str(organization.id)
+    assert response.json()["name"] == organization.name
+
+
+def test_organization_endpoint_requires_authentication(organization_api_client):
+    client, _ = organization_api_client
+
+    response = client.get(f"/api/v1/organizations/{uuid.uuid4()}")
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "error": {
+            "code": "unauthorized",
+            "message": "Authentication required",
+        }
+    }
+
+
+def test_organization_endpoint_rejects_invalid_authentication(
+    organization_api_client,
+):
+    client, _ = organization_api_client
+
+    response = client.get(
+        f"/api/v1/organizations/{uuid.uuid4()}",
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "error": {
+            "code": "unauthorized",
+            "message": "Authentication required",
+        }
+    }
+
+
+def test_organization_endpoint_denies_user_without_membership(
+    organization_api_client,
+):
+    client, make_token = organization_api_client
+
+    response = client.get(
+        f"/api/v1/organizations/{uuid.uuid4()}",
+        headers=_organization_headers(make_token),
+    )
+
+    assert_organization_access_denied(response)
+
+
+@pytest.mark.parametrize(
+    ("organization_status", "membership_status"),
+    [
+        (OrganizationStatus.SUSPENDED.value, MembershipStatus.ACTIVE.value),
+        (OrganizationStatus.ACTIVE.value, MembershipStatus.SUSPENDED.value),
+    ],
+)
+def test_organization_endpoint_denies_inactive_organization_or_membership(
+    organization_api_client,
+    session: Session,
+    organization_status: str,
+    membership_status: str,
+):
+    organization, _, _ = create_member(
+        session,
+        organization_status=organization_status,
+        membership_status=membership_status,
+    )
+    client, make_token = organization_api_client
+
+    response = client.get(
+        f"/api/v1/organizations/{organization.id}",
+        headers=_organization_headers(make_token),
+    )
+
+    assert_organization_access_denied(response)
+
+
+def test_organization_endpoint_denies_cross_organization_access(
+    organization_api_client, session: Session
+):
+    create_member(session)
+    other_organization, _, _ = create_member(
+        session, subject="another-fictional-cognito-subject"
+    )
+    client, make_token = organization_api_client
+
+    response = client.get(
+        f"/api/v1/organizations/{other_organization.id}",
+        headers=_organization_headers(make_token),
+    )
+
+    assert_organization_access_denied(response)
+
+
+def test_organization_endpoint_rejects_mismatched_authorization_context(
+    monkeypatch, organization_api_client, session: Session
+):
+    authorized_organization, _, membership = create_member(session)
+    requested_organization, _, _ = create_member(
+        session, subject="another-fictional-cognito-subject"
+    )
+    client, make_token = organization_api_client
+    lookup_executed = False
+
+    def fail_if_organization_lookup(*args, **kwargs):
+        nonlocal lookup_executed
+        lookup_executed = True
+        pytest.fail("organization lookup must not run for mismatched authorization")
+
+    monkeypatch.setattr(session, "scalar", fail_if_organization_lookup)
+    monkeypatch.setitem(
+        app.dependency_overrides,
+        _organization_membership_dependency,
+        lambda: AuthorizedMembership(
+            organization_id=authorized_organization.id,
+            user_id=membership.user_id,
+            role=MembershipRole.MEMBER,
+        ),
+    )
+
+    response = client.get(
+        f"/api/v1/organizations/{requested_organization.id}",
+        headers=_organization_headers(make_token),
+    )
+
+    assert_organization_access_denied(response)
+    assert lookup_executed is False
+
+
+def test_organization_endpoint_rejects_invalid_organization_id(
+    organization_api_client,
+):
+    client, make_token = organization_api_client
+
+    response = client.get(
+        "/api/v1/organizations/not-a-uuid",
+        headers=_organization_headers(make_token),
+    )
+
+    assert response.status_code == 422
+
+
+def test_organization_endpoint_database_failure_returns_sanitized_503(
+    monkeypatch, organization_api_client, session: Session
+):
+    organization, _, _ = create_member(session)
+    client, make_token = organization_api_client
+    secret_detail = "fictional database failure detail"
+
+    def fail_organization_query(*args, **kwargs):
+        raise OperationalError("SELECT organizations", {}, Exception(secret_detail))
+
+    monkeypatch.setattr(session, "scalar", fail_organization_query)
+    response = client.get(
+        f"/api/v1/organizations/{organization.id}",
+        headers=_organization_headers(make_token),
+    )
+
+    assert_authorization_service_unavailable(response, secret=secret_detail)
 
 
 def assert_organization_access_denied(response):
