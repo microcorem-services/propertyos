@@ -1,4 +1,5 @@
 from datetime import UTC
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import (
@@ -6,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKeyConstraint,
     Index,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -20,13 +22,15 @@ from app.models import (
     PortfolioStatus,
     Site,
     SiteStatus,
+    Unit,
+    UnitStatus,
 )
 
 
 def test_portfolio_table_and_uuid_primary_key_are_declared():
-    assert set(Base.metadata.tables) == {"portfolios", "sites", "buildings"}
+    assert set(Base.metadata.tables) == {"portfolios", "sites", "buildings", "units"}
 
-    for model in (Portfolio, Site, Building):
+    for model in (Portfolio, Site, Building, Unit):
         primary_key = model.__table__.c.id
         assert primary_key.primary_key
         assert primary_key.nullable is False
@@ -222,3 +226,83 @@ def test_building_name_and_status_constraints_are_declared():
         "ck_buildings_status": "status IN ('active', 'inactive')",
     }
     assert {status.value for status in BuildingStatus} == {"active", "inactive"}
+
+
+def test_unit_required_fields_timestamps_and_numeric_area_are_declared():
+    for column_name in (
+        "organization_id",
+        "building_id",
+        "name",
+        "status",
+        "created_at",
+        "updated_at",
+    ):
+        assert Unit.__table__.c[column_name].nullable is False
+
+    assert Unit.__table__.c.unit_code.nullable is True
+    assert Unit.__table__.c.floor.nullable is True
+    assert Unit.__table__.c.area_sqm.nullable is True
+    assert isinstance(Unit.__table__.c.area_sqm.type, Numeric)
+    assert Unit.__table__.c.area_sqm.type.precision == 12
+    assert Unit.__table__.c.area_sqm.type.scale == 2
+    assert Unit.__table__.c.area_sqm.type.python_type is Decimal
+
+    for column_name in ("created_at", "updated_at"):
+        timestamp = Unit.__table__.c[column_name]
+        assert isinstance(timestamp.type, DateTime)
+        assert timestamp.type.timezone is True
+        assert timestamp.default is not None
+        assert timestamp.default.arg(None).utcoffset() == UTC.utcoffset(None)
+
+    assert (
+        Unit.__table__.c.updated_at.onupdate.arg(None).utcoffset()
+        == UTC.utcoffset(None)
+    )
+
+
+def test_unit_building_organization_composite_foreign_key_and_indexes():
+    constraints = [
+        constraint
+        for constraint in Unit.__table__.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    ]
+    assert len(constraints) == 1
+    assert constraints[0].name == "fk_units_building_organization"
+    assert tuple(column.name for column in constraints[0].columns) == (
+        "building_id",
+        "organization_id",
+    )
+    assert tuple(element.target_fullname for element in constraints[0].elements) == (
+        "buildings.id",
+        "buildings.organization_id",
+    )
+
+    building_unique_constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in Building.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert building_unique_constraints == {
+        "uq_buildings_id_organization": ("id", "organization_id")
+    }
+
+    indexes = {
+        tuple(column.name for column in index.columns)
+        for index in Unit.__table__.indexes
+    }
+    assert ("organization_id",) in indexes
+    assert ("building_id",) in indexes
+
+
+def test_unit_name_status_and_positive_area_constraints_are_declared():
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in Unit.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert checks == {
+        "ck_units_name_not_empty": "length(trim(name)) > 0",
+        "ck_units_status": "status IN ('active', 'inactive')",
+        "ck_units_area_sqm_positive": "area_sqm IS NULL OR area_sqm > 0",
+    }
+    assert {status.value for status in UnitStatus} == {"active", "inactive"}

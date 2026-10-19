@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID, uuid4
 
@@ -7,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKeyConstraint,
     Index,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -165,6 +167,11 @@ class Building(Base):
         ),
         Index("ix_buildings_organization_id", "organization_id"),
         Index("ix_buildings_site_id", "site_id"),
+        UniqueConstraint(
+            "id",
+            "organization_id",
+            name="uq_buildings_id_organization",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -203,3 +210,72 @@ class Building(Base):
     )
 
     site: Mapped[Site] = relationship(back_populates="buildings")
+    units: Mapped[list["Unit"]] = relationship(back_populates="building")
+
+
+class UnitStatus(StrEnum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
+class Unit(Base):
+    __tablename__ = "units"
+    __table_args__ = (
+        CheckConstraint(
+            "length(trim(name)) > 0",
+            name="ck_units_name_not_empty",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'inactive')",
+            name="ck_units_status",
+        ),
+        CheckConstraint(
+            "area_sqm IS NULL OR area_sqm > 0",
+            name="ck_units_area_sqm_positive",
+        ),
+        ForeignKeyConstraint(
+            ["building_id", "organization_id"],
+            ["buildings.id", "buildings.organization_id"],
+            name="fk_units_building_organization",
+        ),
+        Index("ix_units_organization_id", "organization_id"),
+        Index("ix_units_building_id", "building_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    building_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    unit_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    floor: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    area_sqm: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=UnitStatus.ACTIVE.value,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+    building: Mapped[Building] = relationship(back_populates="units")
