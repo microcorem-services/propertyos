@@ -19,6 +19,9 @@ export interface SessionStore {
     nextKey: string,
     session: StoredSession,
   ): Promise<boolean>;
+  /** Invalidate the active session family; return false if key is no longer active. */
+  revoke(key: string): Promise<boolean>;
+  /** Remove only this record; used for expired or invalid-record cleanup. */
   delete(key: string): Promise<void>;
 }
 

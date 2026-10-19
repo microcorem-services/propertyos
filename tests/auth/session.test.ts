@@ -48,6 +48,12 @@ class TestSessionStore implements SessionStore {
     return true;
   }
 
+  async revoke(key: string): Promise<boolean> {
+    const existed = this.sessions.has(key);
+    this.sessions.delete(key);
+    return existed;
+  }
+
   async delete(key: string): Promise<void> {
     this.sessions.delete(key);
   }
@@ -149,7 +155,7 @@ test('revokes a session and rejects later retrieval', async () => {
   const manager = createSessionManager(store);
   const created = await manager.create();
 
-  await manager.revoke(created.id);
+  assert.equal(await manager.revoke(created.id), true);
   assert.equal(await manager.retrieve(created.id), null);
   assert.equal(store.size, 0);
 });
@@ -218,6 +224,13 @@ test('rejects invalid session lifetime configuration', () => {
     () => createSessionManager(new TestSessionStore(), {
       absoluteTtlSeconds: 10,
       idleTtlSeconds: 11,
+    }),
+    { name: 'InvalidSessionConfigurationError' },
+  );
+  assert.throws(
+    () => createSessionManager(new TestSessionStore(), {
+      absoluteTtlSeconds: 8 * 60 * 60 + 1,
+      idleTtlSeconds: 30 * 60,
     }),
     { name: 'InvalidSessionConfigurationError' },
   );

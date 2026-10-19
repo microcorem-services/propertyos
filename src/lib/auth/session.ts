@@ -9,6 +9,7 @@ import {
 
 const DEFAULT_ABSOLUTE_TTL_SECONDS = 8 * 60 * 60;
 const DEFAULT_IDLE_TTL_SECONDS = 30 * 60;
+const MAX_ABSOLUTE_TTL_SECONDS = 8 * 60 * 60;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export type Session = {
@@ -88,6 +89,7 @@ export function createSessionManager(
   if (
     !Number.isSafeInteger(absoluteTtlSeconds) ||
     absoluteTtlSeconds <= 0 ||
+    absoluteTtlSeconds > MAX_ABSOLUTE_TTL_SECONDS ||
     !Number.isSafeInteger(idleTtlSeconds) ||
     idleTtlSeconds <= 0 ||
     idleTtlSeconds > absoluteTtlSeconds
@@ -202,10 +204,11 @@ export function createSessionManager(
       throw new Error('Unable to rotate the session identifier.');
     },
 
-    async revoke(id: string): Promise<void> {
+    async revoke(id: string): Promise<boolean> {
       if (isSessionId(id)) {
-        await store.delete(sessionKey(id));
+        return store.revoke(sessionKey(id));
       }
+      return false;
     },
   };
 }

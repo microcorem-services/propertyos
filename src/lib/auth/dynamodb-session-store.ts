@@ -8,9 +8,7 @@ import {
   DeleteCommand,
   DynamoDBDocumentClient,
   GetCommand,
-  PutCommand,
   TransactWriteCommand,
-  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import {
   SessionStoreNotConfiguredError,
@@ -22,6 +20,8 @@ const DEFAULT_IDLE_TTL_SECONDS = 30 * 60;
 const DEFAULT_CONNECTION_TIMEOUT_MS = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
 const SESSION_KEY_PATTERN = /^[a-f0-9]{64}$/;
+const REVOCATION_KEY_PREFIX = 'revoked#';
+const REVOCATION_RETENTION_MARGIN_SECONDS = 60;
 
 export type DynamoDbSessionStoreOptions = {
   client: DynamoDBDocumentClient;
@@ -94,6 +94,32 @@ function getRecord(item: Record<string, unknown> | undefined): StoredSession | n
   return session;
 }
 
+type DynamoSessionRecord = {
+  session: StoredSession;
+  familyKey: string;
+  status: 'active' | 'rotated';
+};
+
+function getDynamoSessionRecord(
+  item: Record<string, unknown> | undefined,
+): DynamoSessionRecord | null {
+  if (item === undefined) return null;
+  const session = getRecord(item);
+  if (
+    !session ||
+    typeof item.familyKey !== 'string' ||
+    !SESSION_KEY_PATTERN.test(item.familyKey) ||
+    (item.status !== undefined && item.status !== 'rotated')
+  ) {
+    throw new InvalidDynamoDbSessionRecordError();
+  }
+  return {
+    session,
+    familyKey: item.familyKey,
+    status: item.status === 'rotated' ? 'rotated' : 'active',
+  };
+}
+
 function isConditionalFailure(error: unknown): boolean {
   return (
     error !== null &&
@@ -149,6 +175,7 @@ export function createDynamoDbSessionStore(
     }
     return {
       sessionKey: key,
+      familyKey: key,
       data: { ...session.data },
       createdAt: session.createdAt,
       lastSeenAt: session.lastSeenAt,
@@ -162,7 +189,18 @@ export function createDynamoDbSessionStore(
     };
   }
 
-  async function read(key: string): Promise<StoredSession | null> {
+  function revocationKey(familyKey: string): string {
+    return `${REVOCATION_KEY_PREFIX}${familyKey}`;
+  }
+
+  function revocationExpiresAt(session: StoredSession): number {
+    return (
+      Math.ceil(session.absoluteExpiresAt / 1000) +
+      REVOCATION_RETENTION_MARGIN_SECONDS
+    );
+  }
+
+  async function readRecord(key: string): Promise<DynamoSessionRecord | null> {
     const result = await client.send(
       new GetCommand({
         TableName: tableName,
@@ -170,11 +208,33 @@ export function createDynamoDbSessionStore(
         ConsistentRead: true,
       }),
     );
-    const session = getRecord(result.Item);
-    if (!session || !hasActiveLifetime(session, now(), idleTtlSeconds)) {
+    return getDynamoSessionRecord(result.Item);
+  }
+
+  async function isRevoked(familyKey: string): Promise<boolean> {
+    const result = await client.send(
+      new GetCommand({
+        TableName: tableName,
+        Key: { sessionKey: revocationKey(familyKey) },
+        ConsistentRead: true,
+        ProjectionExpression: '#sessionKey',
+        ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
+      }),
+    );
+    return result.Item !== undefined;
+  }
+
+  async function read(key: string): Promise<StoredSession | null> {
+    const record = await readRecord(key);
+    if (
+      !record ||
+      record.status !== 'active' ||
+      !hasActiveLifetime(record.session, now(), idleTtlSeconds) ||
+      await isRevoked(record.familyKey)
+    ) {
       return null;
     }
-    return session;
+    return record.session;
   }
 
   return {
@@ -182,16 +242,33 @@ export function createDynamoDbSessionStore(
       const item = toItem(key, session);
       try {
         await client.send(
-          new PutCommand({
-            TableName: tableName,
-            Item: item,
-            ConditionExpression: 'attribute_not_exists(#sessionKey)',
-            ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Put: {
+                  TableName: tableName,
+                  Item: item,
+                  ConditionExpression: 'attribute_not_exists(#sessionKey)',
+                  ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
+                },
+              },
+              {
+                ConditionCheck: {
+                  TableName: tableName,
+                  Key: { sessionKey: revocationKey(key) },
+                  ConditionExpression: 'attribute_not_exists(#sessionKey)',
+                  ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
+                },
+              },
+            ],
           }),
         );
         return true;
       } catch (error) {
-        if (isConditionalFailure(error)) return false;
+        if (
+          isConditionalFailure(error) ||
+          isConditionalTransactionFailure(error)
+        ) return false;
         throw error;
       }
     },
@@ -207,6 +284,13 @@ export function createDynamoDbSessionStore(
         throw new TypeError('Session record is invalid.');
       }
       const at = now();
+      const current = await readRecord(key);
+      if (
+        !current ||
+        current.status !== 'active' ||
+        !hasActiveLifetime(current.session, at, idleTtlSeconds) ||
+        await isRevoked(current.familyKey)
+      ) return false;
       const idleCutoff = at - idleTtlSeconds * 1000;
       const expiresAt = Math.floor(
         Math.min(
@@ -216,30 +300,50 @@ export function createDynamoDbSessionStore(
       );
       try {
         await client.send(
-          new UpdateCommand({
-            TableName: tableName,
-            Key: { sessionKey: key },
-            UpdateExpression: 'SET #lastSeenAt = :lastSeenAt, #expiresAt = :expiresAt',
-            ConditionExpression:
-              'attribute_exists(#sessionKey) AND #absoluteExpiresAt > :now AND #lastSeenAt > :idleCutoff AND #lastSeenAt <= :newLastSeenAt',
-            ExpressionAttributeNames: {
-              '#sessionKey': 'sessionKey',
-              '#lastSeenAt': 'lastSeenAt',
-              '#absoluteExpiresAt': 'absoluteExpiresAt',
-              '#expiresAt': 'expiresAt',
-            },
-            ExpressionAttributeValues: {
-              ':lastSeenAt': session.lastSeenAt,
-              ':newLastSeenAt': session.lastSeenAt,
-              ':expiresAt': expiresAt,
-              ':now': at,
-              ':idleCutoff': idleCutoff,
-            },
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Update: {
+                  TableName: tableName,
+                  Key: { sessionKey: key },
+                  UpdateExpression: 'SET #lastSeenAt = :lastSeenAt, #expiresAt = :expiresAt',
+                  ConditionExpression:
+                    'attribute_exists(#sessionKey) AND #familyKey = :familyKey AND attribute_not_exists(#status) AND #absoluteExpiresAt > :now AND #lastSeenAt > :idleCutoff AND #lastSeenAt <= :newLastSeenAt',
+                  ExpressionAttributeNames: {
+                    '#sessionKey': 'sessionKey',
+                    '#familyKey': 'familyKey',
+                    '#lastSeenAt': 'lastSeenAt',
+                    '#absoluteExpiresAt': 'absoluteExpiresAt',
+                    '#expiresAt': 'expiresAt',
+                    '#status': 'status',
+                  },
+                  ExpressionAttributeValues: {
+                    ':familyKey': current.familyKey,
+                    ':lastSeenAt': session.lastSeenAt,
+                    ':newLastSeenAt': session.lastSeenAt,
+                    ':expiresAt': expiresAt,
+                    ':now': at,
+                    ':idleCutoff': idleCutoff,
+                  },
+                },
+              },
+              {
+                ConditionCheck: {
+                  TableName: tableName,
+                  Key: { sessionKey: revocationKey(current.familyKey) },
+                  ConditionExpression: 'attribute_not_exists(#sessionKey)',
+                  ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
+                },
+              },
+            ],
           }),
         );
         return true;
       } catch (error) {
-        if (isConditionalFailure(error)) return false;
+        if (
+          isConditionalFailure(error) ||
+          isConditionalTransactionFailure(error)
+        ) return false;
         throw error;
       }
     },
@@ -248,8 +352,14 @@ export function createDynamoDbSessionStore(
       assertKey(currentKey);
       assertKey(nextKey);
       const item = toItem(nextKey, session);
-      const current = await read(currentKey);
-      if (!current) return false;
+      const current = await readRecord(currentKey);
+      if (
+        !current ||
+        current.status !== 'active' ||
+        !hasActiveLifetime(current.session, now(), idleTtlSeconds) ||
+        await isRevoked(current.familyKey)
+      ) return false;
+      item.familyKey = current.familyKey;
 
       const at = now();
       const idleCutoff = at - idleTtlSeconds * 1000;
@@ -268,21 +378,37 @@ export function createDynamoDbSessionStore(
                 },
               },
               {
-                Delete: {
+                Update: {
                   TableName: tableName,
                   Key: { sessionKey: currentKey },
+                  UpdateExpression:
+                    'SET #status = :rotated, #data = :emptyData, #expiresAt = :absoluteExpiresAt',
                   ConditionExpression:
-                    'attribute_exists(#sessionKey) AND #lastSeenAt = :expectedLastSeenAt AND #absoluteExpiresAt > :now AND #lastSeenAt > :idleCutoff',
+                    'attribute_exists(#sessionKey) AND attribute_not_exists(#status) AND #lastSeenAt = :expectedLastSeenAt AND #absoluteExpiresAt > :now AND #lastSeenAt > :idleCutoff',
                   ExpressionAttributeNames: {
                     '#sessionKey': 'sessionKey',
                     '#lastSeenAt': 'lastSeenAt',
                     '#absoluteExpiresAt': 'absoluteExpiresAt',
+                    '#status': 'status',
+                    '#data': 'data',
+                    '#expiresAt': 'expiresAt',
                   },
                   ExpressionAttributeValues: {
-                    ':expectedLastSeenAt': current.lastSeenAt,
+                    ':expectedLastSeenAt': current.session.lastSeenAt,
                     ':now': at,
                     ':idleCutoff': idleCutoff,
+                    ':rotated': 'rotated',
+                    ':emptyData': {},
+                    ':absoluteExpiresAt': revocationExpiresAt(current.session),
                   },
+                },
+              },
+              {
+                ConditionCheck: {
+                  TableName: tableName,
+                  Key: { sessionKey: revocationKey(current.familyKey) },
+                  ConditionExpression: 'attribute_not_exists(#sessionKey)',
+                  ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
                 },
               },
             ],
@@ -297,12 +423,83 @@ export function createDynamoDbSessionStore(
 
     async delete(key) {
       assertKey(key);
-      await client.send(
-        new DeleteCommand({
-          TableName: tableName,
-          Key: { sessionKey: key },
-        }),
-      );
+      const record = await readRecord(key);
+      if (!record) return;
+      if (
+        record.status === 'rotated' &&
+        now() < record.session.absoluteExpiresAt
+      ) return;
+      try {
+        await client.send(
+          new DeleteCommand({
+            TableName: tableName,
+            Key: { sessionKey: key },
+            ConditionExpression: '#familyKey = :familyKey',
+            ExpressionAttributeNames: { '#familyKey': 'familyKey' },
+            ExpressionAttributeValues: { ':familyKey': record.familyKey },
+          }),
+        );
+      } catch (error) {
+        if (isConditionalFailure(error)) return;
+        throw error;
+      }
+    },
+
+    async revoke(key) {
+      assertKey(key);
+      const record = await readRecord(key);
+      if (
+        !record ||
+        record.status !== 'active' ||
+        !hasActiveLifetime(record.session, now(), idleTtlSeconds)
+      ) return false;
+      const at = now();
+      const idleCutoff = at - idleTtlSeconds * 1000;
+      try {
+        await client.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Put: {
+                  TableName: tableName,
+                  Item: {
+                    sessionKey: revocationKey(record.familyKey),
+                    revokedAt: at,
+                    expiresAt: revocationExpiresAt(record.session),
+                  },
+                  ConditionExpression: 'attribute_not_exists(#sessionKey)',
+                  ExpressionAttributeNames: { '#sessionKey': 'sessionKey' },
+                },
+              },
+              {
+                Delete: {
+                  TableName: tableName,
+                  Key: { sessionKey: key },
+                  ConditionExpression:
+                    '#familyKey = :familyKey AND attribute_not_exists(#status) AND #absoluteExpiresAt > :now AND #lastSeenAt > :idleCutoff',
+                  ExpressionAttributeNames: {
+                    '#familyKey': 'familyKey',
+                    '#status': 'status',
+                    '#absoluteExpiresAt': 'absoluteExpiresAt',
+                    '#lastSeenAt': 'lastSeenAt',
+                  },
+                  ExpressionAttributeValues: {
+                    ':familyKey': record.familyKey,
+                    ':now': at,
+                    ':idleCutoff': idleCutoff,
+                  },
+                },
+              },
+            ],
+          }),
+        );
+        return true;
+      } catch (error) {
+        if (isConditionalTransactionFailure(error)) {
+          return isRevoked(record.familyKey);
+        }
+        throw error;
+      }
     },
   };
 }
