@@ -65,6 +65,8 @@ class InternalAuthorizationDecisionRequest(BaseModel):
         "property-assets.sites.update",
         "property-assets.buildings.create",
         "property-assets.buildings.update",
+        "property-assets.units.create",
+        "property-assets.units.update",
     ]
 
 
@@ -78,6 +80,8 @@ class InternalAuthorizationDecisionResponse(BaseModel):
         "property-assets.sites.update",
         "property-assets.buildings.create",
         "property-assets.buildings.update",
+        "property-assets.units.create",
+        "property-assets.units.update",
     ]
     allowed: Literal[True]
     actor_id: UUID

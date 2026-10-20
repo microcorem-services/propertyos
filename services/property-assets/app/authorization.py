@@ -22,6 +22,8 @@ AuthorizationOperation = Literal[
     "property-assets.sites.update",
     "property-assets.buildings.create",
     "property-assets.buildings.update",
+    "property-assets.units.create",
+    "property-assets.units.update",
 ]
 READ_OPERATION: AuthorizationOperation = "property-assets.portfolios.read"
 CREATE_OPERATION: AuthorizationOperation = "property-assets.portfolios.create"
@@ -30,6 +32,8 @@ CREATE_SITE_OPERATION: AuthorizationOperation = "property-assets.sites.create"
 UPDATE_SITE_OPERATION: AuthorizationOperation = "property-assets.sites.update"
 CREATE_BUILDING_OPERATION: AuthorizationOperation = "property-assets.buildings.create"
 UPDATE_BUILDING_OPERATION: AuthorizationOperation = "property-assets.buildings.update"
+CREATE_UNIT_OPERATION: AuthorizationOperation = "property-assets.units.create"
+UPDATE_UNIT_OPERATION: AuthorizationOperation = "property-assets.units.update"
 WRITE_OPERATIONS = (
     CREATE_OPERATION,
     UPDATE_OPERATION,
@@ -37,6 +41,8 @@ WRITE_OPERATIONS = (
     UPDATE_SITE_OPERATION,
     CREATE_BUILDING_OPERATION,
     UPDATE_BUILDING_OPERATION,
+    CREATE_UNIT_OPERATION,
+    UPDATE_UNIT_OPERATION,
 )
 DECISION_PATH = "/internal/v1/authorization/decisions"
 _JWT_ACCESS_TOKEN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
@@ -74,6 +80,12 @@ class SiteWritePermissions:
 
 @dataclass(frozen=True)
 class BuildingWritePermissions:
+    can_create: bool
+    can_update: bool
+
+
+@dataclass(frozen=True)
+class UnitWritePermissions:
     can_create: bool
     can_update: bool
 
@@ -336,4 +348,34 @@ def get_building_write_permissions(
     return BuildingWritePermissions(
         can_create=allowed(CREATE_BUILDING_OPERATION),
         can_update=allowed(UPDATE_BUILDING_OPERATION),
+    )
+
+
+def get_unit_write_permissions(
+    organization_id: UUID,
+    user_token: str,
+    workload_token: str,
+) -> UnitWritePermissions:
+    require_organization_authorization(
+        organization_id,
+        user_token,
+        workload_token,
+        READ_OPERATION,
+    )
+
+    def allowed(operation: AuthorizationOperation) -> bool:
+        try:
+            require_organization_authorization(
+                organization_id,
+                user_token,
+                workload_token,
+                operation,
+            )
+        except OrganizationAccessDenied:
+            return False
+        return True
+
+    return UnitWritePermissions(
+        can_create=allowed(CREATE_UNIT_OPERATION),
+        can_update=allowed(UPDATE_UNIT_OPERATION),
     )

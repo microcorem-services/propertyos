@@ -58,6 +58,11 @@ export type BuildingWritePermissions = {
   can_update: boolean;
 };
 
+export type UnitWritePermissions = {
+  can_create: boolean;
+  can_update: boolean;
+};
+
 export type PortfolioEditableFields = {
   name: string;
   status: 'active' | 'inactive';
@@ -86,6 +91,22 @@ export type BuildingUpdateFields = {
   name?: string;
   building_code?: string | null;
   address?: string | null;
+  status?: 'active' | 'inactive';
+};
+
+export type UnitEditableFields = {
+  name: string;
+  unit_code?: string | null;
+  floor?: string | null;
+  area_sqm?: string | null;
+  status: 'active' | 'inactive';
+};
+
+export type UnitUpdateFields = {
+  name?: string;
+  unit_code?: string | null;
+  floor?: string | null;
+  area_sqm?: string | null;
   status?: 'active' | 'inactive';
 };
 
@@ -247,9 +268,8 @@ function parseAsset(
   const area = value.area_sqm;
   const validArea =
     area === null ||
-    (typeof area === 'number' && Number.isFinite(area) && area > 0) ||
-    (typeof area === 'string' &&
-      /^\d+(?:\.\d+)?$/.test(area) &&
+    ((typeof area === 'number' || typeof area === 'string') &&
+      /^(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?$/.test(String(area)) &&
       Number.isFinite(Number(area)) &&
       Number(area) > 0);
   if (
@@ -1129,6 +1149,222 @@ export function updateBuilding(
     organizationId,
     fields,
     buildingId,
+  );
+}
+
+export async function fetchUnitWritePermissions(
+  organizationId: string,
+  signal?: AbortSignal,
+): Promise<UnitWritePermissions> {
+  if (!UUID_PATTERN.test(organizationId)) {
+    throw new PortfoliosRequestError('Choose a valid organisation first.', 400);
+  }
+  let response: Response;
+  try {
+    const query = new URLSearchParams({ organizationId });
+    response = await fetch(`/api/unit-write-permissions?${query}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: { Accept: 'application/json' },
+      signal,
+    });
+  } catch {
+    throw new PortfoliosRequestError(
+      'Unit permissions could not be reached. Please try again.',
+      0,
+    );
+  }
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have access to this organisation.',
+      403,
+    );
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      'Unit permissions could not be verified.',
+      response.status,
+    );
+  }
+  try {
+    const payload: unknown = await response.json();
+    if (
+      !isRecord(payload) ||
+      Object.keys(payload).length !== 2 ||
+      typeof payload.can_create !== 'boolean' ||
+      typeof payload.can_update !== 'boolean'
+    ) {
+      throw new TypeError();
+    }
+    return { can_create: payload.can_create, can_update: payload.can_update };
+  } catch {
+    throw new PortfoliosRequestError(
+      'Unit permissions could not be verified.',
+      502,
+    );
+  }
+}
+
+async function writeUnit(
+  method: 'POST' | 'PATCH',
+  portfolioId: string,
+  siteId: string,
+  buildingId: string,
+  organizationId: string,
+  fields: UnitEditableFields | UnitUpdateFields,
+  unitId?: string,
+): Promise<Unit> {
+  if (
+    ![portfolioId, siteId, buildingId, organizationId].every((id) =>
+      UUID_PATTERN.test(id),
+    ) ||
+    (method === 'PATCH' && (!unitId || !UUID_PATTERN.test(unitId))) ||
+    (method === 'POST' && unitId !== undefined)
+  ) {
+    throw new PortfoliosRequestError('Choose a valid unit first.', 400);
+  }
+  const keys = Object.keys(fields);
+  const name = fields.name?.trim();
+  const area = fields.area_sqm;
+  if (
+    keys.length === 0 ||
+    keys.some(
+      (key) =>
+        !['name', 'unit_code', 'floor', 'area_sqm', 'status'].includes(key),
+    ) ||
+    (fields.name !== undefined && (!name || name.length > 200)) ||
+    (fields.unit_code !== undefined &&
+      fields.unit_code !== null &&
+      (typeof fields.unit_code !== 'string' || fields.unit_code.length > 100)) ||
+    (fields.floor !== undefined &&
+      fields.floor !== null &&
+      (typeof fields.floor !== 'string' || fields.floor.length > 50)) ||
+    (area !== undefined &&
+      area !== null &&
+      (!/^(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?$/.test(area) ||
+        !Number.isFinite(Number(area)) ||
+        Number(area) <= 0)) ||
+    (fields.status !== undefined &&
+      fields.status !== 'active' &&
+      fields.status !== 'inactive') ||
+    (method === 'POST' && !name)
+  ) {
+    throw new PortfoliosRequestError('Enter valid unit details.', 400);
+  }
+
+  const body: UnitUpdateFields = { ...fields };
+  if (fields.name !== undefined) body.name = name;
+  if (typeof fields.unit_code === 'string') {
+    body.unit_code = fields.unit_code.trim() || null;
+  }
+  if (typeof fields.floor === 'string') body.floor = fields.floor.trim() || null;
+  if (typeof fields.area_sqm === 'string') body.area_sqm = fields.area_sqm.trim();
+  const query = new URLSearchParams({
+    organizationId,
+    portfolioId,
+    siteId,
+    buildingId,
+  });
+  const collectionPath = `/api/portfolios/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings/${encodeURIComponent(buildingId)}/units`;
+  const path =
+    method === 'POST'
+      ? `${collectionPath}?${query}`
+      : `${collectionPath}/${encodeURIComponent(unitId ?? '')}?${query}`;
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new PortfoliosRequestError(
+      'Unit changes could not be submitted. Please try again.',
+      0,
+    );
+  }
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have permission to change units.',
+      403,
+    );
+  }
+  if (response.status === 404) {
+    throw new PortfoliosRequestError('Unit or parent asset not found.', 404);
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      response.status === 503
+        ? 'The property service is temporarily unavailable. Please try again.'
+        : 'Unit details could not be saved. Please review your changes.',
+      response.status,
+    );
+  }
+  try {
+    const asset = parseAsset(
+      await response.json(),
+      'unit',
+      organizationId,
+      { portfolioId, siteId, buildingId },
+      unitId,
+    );
+    if (!('building_id' in asset)) throw new TypeError();
+    return asset;
+  } catch {
+    throw new PortfoliosRequestError(
+      'The saved unit could not be verified.',
+      502,
+    );
+  }
+}
+
+export function createUnit(
+  portfolioId: string,
+  siteId: string,
+  buildingId: string,
+  organizationId: string,
+  fields: UnitEditableFields,
+): Promise<Unit> {
+  return writeUnit(
+    'POST',
+    portfolioId,
+    siteId,
+    buildingId,
+    organizationId,
+    fields,
+  );
+}
+
+export function updateUnit(
+  unitId: string,
+  portfolioId: string,
+  siteId: string,
+  buildingId: string,
+  organizationId: string,
+  fields: UnitUpdateFields,
+): Promise<Unit> {
+  return writeUnit(
+    'PATCH',
+    portfolioId,
+    siteId,
+    buildingId,
+    organizationId,
+    fields,
+    unitId,
   );
 }
 

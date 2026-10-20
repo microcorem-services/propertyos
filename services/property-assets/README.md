@@ -44,6 +44,12 @@ The Registry exposes `POST /api/v1/buildings?organization_id=<UUID>` and `PATCH 
 
 Successful mutations and their `building_audit_events` rows share one database transaction. Audit rows record organization, building, operation, trusted actor ID, timestamp, and permitted changed-field names without field values, credentials, or tokens. Apply migration `0007_building_audit` before enabling these routes. The Next.js BFF exposes `GET /api/building-write-permissions?organizationId=<UUID>`, `POST /api/buildings?organizationId=<UUID>&portfolioId=<UUID>&siteId=<UUID>`, and `PATCH /api/buildings/{buildingId}?organizationId=<UUID>&portfolioId=<UUID>&siteId=<UUID>`. It reuses the server-side session, Origin/CSRF checks, Registry origin restriction, timeout, redirect protection, strict response parsing, and no-store behavior of the site write endpoints.
 
+## Unit writes and audit trail
+
+The Registry exposes `POST /api/v1/units?organization_id=<UUID>` and `PATCH /api/v1/units/{unit_id}?organization_id=<UUID>&portfolio_id=<UUID>&site_id=<UUID>&building_id=<UUID>`. Both operations independently request the corresponding `property-assets.units.create` or `property-assets.units.update` decision; Organization & Access grants writes only to active owners and admins. Creation validates the full organization → portfolio → site → building hierarchy. Updates scope the Unit to that full persisted path and cannot change its ownership or parent. Only `name`, `unit_code`, `floor`, `area_sqm`, and `status` can be edited.
+
+Successful writes and their `unit_audit_events` rows share one transaction. Audit rows contain organization and Unit IDs, operation, trusted actor ID, timestamp, and changed-field names, never field values or credentials. Apply migration `0008_unit_audit` before enabling writes. The same-origin BFF exposes `GET /api/unit-write-permissions?organizationId=<UUID>`, `POST /api/units?organizationId=<UUID>&portfolioId=<UUID>&siteId=<UUID>&buildingId=<UUID>`, and `PATCH /api/units/{unitId}` with the same identifiers. It reuses server-side sessions, Origin validation, bounded Registry requests, redirect rejection, response validation, and no-store behavior.
+
 ## Protected property hierarchy
 
 The following read-only endpoints use the same user authentication and `property-assets.portfolios.read` organization decision:

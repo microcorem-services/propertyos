@@ -16,16 +16,19 @@ from app.authorization import (
     CREATE_BUILDING_OPERATION,
     CREATE_OPERATION,
     CREATE_SITE_OPERATION,
+    CREATE_UNIT_OPERATION,
     OrganizationAccessDenied,
     UPDATE_OPERATION,
     UPDATE_BUILDING_OPERATION,
     UPDATE_SITE_OPERATION,
+    UPDATE_UNIT_OPERATION,
     UserAuthenticationRequired,
     get_authorization_workload_token,
     get_authorized_organization,
     get_building_write_permissions,
     get_portfolio_write_permissions,
     get_site_write_permissions,
+    get_unit_write_permissions,
     get_user_bearer_token,
     write_authorization,
 )
@@ -38,6 +41,7 @@ from app.models import (
     Site,
     SiteAuditEvent,
     Unit,
+    UnitAuditEvent,
 )
 from app.schemas import (
     BuildingUpdateRequest,
@@ -53,6 +57,9 @@ from app.schemas import (
     SiteWritePermissionsResponse,
     SiteWriteRequest,
     UnitResponse,
+    UnitUpdateRequest,
+    UnitWritePermissionsResponse,
+    UnitWriteRequest,
 )
 
 app = FastAPI(title="BOWERA Property & Asset Registry", version="0.1.0")
@@ -70,6 +77,8 @@ _create_site_authorization = write_authorization(CREATE_SITE_OPERATION)
 _update_site_authorization = write_authorization(UPDATE_SITE_OPERATION)
 _create_building_authorization = write_authorization(CREATE_BUILDING_OPERATION)
 _update_building_authorization = write_authorization(UPDATE_BUILDING_OPERATION)
+_create_unit_authorization = write_authorization(CREATE_UNIT_OPERATION)
+_update_unit_authorization = write_authorization(UPDATE_UNIT_OPERATION)
 
 
 def get_portfolio_session() -> Generator[Session, None, None]:
@@ -250,6 +259,18 @@ def building_write_permissions(
         user_token,
         workload_token,
     )
+
+
+@api_router.get(
+    "/unit-write-permissions",
+    response_model=UnitWritePermissionsResponse,
+)
+def unit_write_permissions(
+    organization_id: UUID = Query(...),
+    user_token: str = Depends(get_user_bearer_token),
+    workload_token: str = Depends(get_authorization_workload_token),
+):
+    return get_unit_write_permissions(organization_id, user_token, workload_token)
 
 
 @api_router.post(
@@ -557,6 +578,152 @@ def update_building(
     except SQLAlchemyError:
         raise PropertyDatabaseUnavailable from None
     return building
+
+
+@api_router.post("/units", response_model=UnitResponse, status_code=201)
+def create_unit(
+    payload: UnitWriteRequest,
+    _authorization: AuthorizedOrganization = Depends(_create_unit_authorization),
+    session: Session = Depends(get_portfolio_session),
+) -> Unit:
+    try:
+        with session.begin():
+            parent_exists = session.scalar(
+                select(Building.id)
+                .join(
+                    Site,
+                    and_(
+                        Building.site_id == Site.id,
+                        Building.organization_id == Site.organization_id,
+                    ),
+                )
+                .join(
+                    Portfolio,
+                    and_(
+                        Site.portfolio_id == Portfolio.id,
+                        Site.organization_id == Portfolio.organization_id,
+                    ),
+                )
+                .where(
+                    Building.id == payload.building_id,
+                    Building.site_id == payload.site_id,
+                    Building.organization_id == _authorization.organization_id,
+                    Site.id == payload.site_id,
+                    Site.portfolio_id == payload.portfolio_id,
+                    Site.organization_id == _authorization.organization_id,
+                    Portfolio.id == payload.portfolio_id,
+                    Portfolio.organization_id == _authorization.organization_id,
+                )
+            )
+            if parent_exists is None:
+                raise HTTPException(status_code=404, detail="Asset not found")
+
+            unit = Unit(
+                organization_id=_authorization.organization_id,
+                building_id=payload.building_id,
+                name=payload.name,
+                unit_code=payload.unit_code,
+                floor=payload.floor,
+                area_sqm=payload.area_sqm,
+                status=payload.status,
+            )
+            session.add(unit)
+            session.flush()
+            session.add(
+                UnitAuditEvent(
+                    organization_id=_authorization.organization_id,
+                    unit_id=unit.id,
+                    operation=CREATE_UNIT_OPERATION,
+                    actor_id=_authorization.actor_id,
+                    changed_fields=[
+                        "area_sqm",
+                        "floor",
+                        "name",
+                        "status",
+                        "unit_code",
+                    ],
+                )
+            )
+            session.flush()
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
+    return unit
+
+
+@api_router.patch("/units/{unit_id}", response_model=UnitResponse)
+def update_unit(
+    unit_id: UUID,
+    portfolio_id: UUID,
+    site_id: UUID,
+    building_id: UUID,
+    payload: UnitUpdateRequest,
+    _authorization: AuthorizedOrganization = Depends(_update_unit_authorization),
+    session: Session = Depends(get_portfolio_session),
+) -> Unit:
+    updates = payload.model_dump(exclude_unset=True)
+    try:
+        with session.begin():
+            unit = session.scalar(
+                select(Unit)
+                .join(
+                    Building,
+                    and_(
+                        Unit.building_id == Building.id,
+                        Unit.organization_id == Building.organization_id,
+                    ),
+                )
+                .join(
+                    Site,
+                    and_(
+                        Building.site_id == Site.id,
+                        Building.organization_id == Site.organization_id,
+                    ),
+                )
+                .join(
+                    Portfolio,
+                    and_(
+                        Site.portfolio_id == Portfolio.id,
+                        Site.organization_id == Portfolio.organization_id,
+                    ),
+                )
+                .where(
+                    Unit.id == unit_id,
+                    Unit.building_id == building_id,
+                    Unit.organization_id == _authorization.organization_id,
+                    Building.id == building_id,
+                    Building.site_id == site_id,
+                    Building.organization_id == _authorization.organization_id,
+                    Site.id == site_id,
+                    Site.portfolio_id == portfolio_id,
+                    Site.organization_id == _authorization.organization_id,
+                    Portfolio.id == portfolio_id,
+                    Portfolio.organization_id == _authorization.organization_id,
+                )
+            )
+            if unit is None:
+                raise HTTPException(status_code=404, detail="Asset not found")
+
+            changed_fields = sorted(
+                field
+                for field, value in updates.items()
+                if value != getattr(unit, field)
+            )
+            for field, value in updates.items():
+                setattr(unit, field, value)
+            unit.updated_at = datetime.now(UTC)
+            session.add(
+                UnitAuditEvent(
+                    organization_id=_authorization.organization_id,
+                    unit_id=unit.id,
+                    operation=UPDATE_UNIT_OPERATION,
+                    actor_id=_authorization.actor_id,
+                    changed_fields=changed_fields,
+                )
+            )
+            session.flush()
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
+    return unit
 
 
 @api_router.get(

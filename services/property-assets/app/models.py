@@ -382,3 +382,33 @@ class Unit(Base):
     )
 
     building: Mapped[Building] = relationship(back_populates="units")
+
+
+class UnitAuditEvent(Base):
+    __tablename__ = "unit_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('property-assets.units.create', "
+            "'property-assets.units.update')",
+            name="ck_unit_audit_operation",
+        ),
+        Index("ix_unit_audit_organization_unit", "organization_id", "unit_id"),
+        Index("ix_unit_audit_occurred_at", "occurred_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    unit_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)

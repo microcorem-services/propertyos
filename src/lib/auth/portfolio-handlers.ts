@@ -231,6 +231,45 @@ function requestedBuildingIdentifiers(
   };
 }
 
+function requestedUnitIdentifiers(
+  requestUrl: URL,
+): {
+  organizationId: string;
+  portfolioId: string;
+  siteId: string;
+  buildingId: string;
+} | null {
+  const keys = [...requestUrl.searchParams.keys()].sort();
+  if (
+    keys.length !== 4 ||
+    keys[0] !== 'buildingId' ||
+    keys[1] !== 'organizationId' ||
+    keys[2] !== 'portfolioId' ||
+    keys[3] !== 'siteId'
+  ) {
+    return null;
+  }
+  const identifiers = {
+    organizationId: requestUrl.searchParams.getAll('organizationId'),
+    portfolioId: requestUrl.searchParams.getAll('portfolioId'),
+    siteId: requestUrl.searchParams.getAll('siteId'),
+    buildingId: requestUrl.searchParams.getAll('buildingId'),
+  };
+  if (
+    Object.values(identifiers).some(
+      (values) => values.length !== 1 || !UUID_PATTERN.test(values[0]),
+    )
+  ) {
+    return null;
+  }
+  return {
+    organizationId: identifiers.organizationId[0],
+    portfolioId: identifiers.portfolioId[0],
+    siteId: identifiers.siteId[0],
+    buildingId: identifiers.buildingId[0],
+  };
+}
+
 async function readAccessToken(
   request: Request,
   sessions: () => PortfolioSessionManager,
@@ -411,9 +450,8 @@ function parseHierarchyAsset(
   const area = asset.area_sqm;
   const areaValid =
     area === null ||
-    (typeof area === 'number' && Number.isFinite(area) && area > 0) ||
-    (typeof area === 'string' &&
-      /^\d+(?:\.\d+)?$/.test(area) &&
+    ((typeof area === 'number' || typeof area === 'string') &&
+      /^(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?$/.test(String(area)) &&
       Number.isFinite(Number(area)) &&
       Number(area) > 0);
   if (
@@ -630,6 +668,85 @@ function parseEditableBuildingPayload(
     }
     parsed[field] =
       typeof valueForField === 'string' ? valueForField.trim() : null;
+  }
+  if (Object.hasOwn(payload, 'status')) {
+    if (payload.status !== 'active' && payload.status !== 'inactive') {
+      return null;
+    }
+    parsed.status = payload.status;
+  }
+  return parsed;
+}
+
+function parseEditableUnitPayload(
+  value: unknown,
+  patch: boolean,
+): {
+  name?: string;
+  unit_code?: string | null;
+  floor?: string | null;
+  area_sqm?: string | null;
+  status?: 'active' | 'inactive';
+} | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const payload = value as Record<string, unknown>;
+  const fields = ['name', 'unit_code', 'floor', 'area_sqm', 'status'];
+  const keys = Object.keys(payload);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => !fields.includes(key)) ||
+    (!patch && !Object.hasOwn(payload, 'name'))
+  ) {
+    return null;
+  }
+  const parsed: {
+    name?: string;
+    unit_code?: string | null;
+    floor?: string | null;
+    area_sqm?: string | null;
+    status?: 'active' | 'inactive';
+  } = {};
+  if (Object.hasOwn(payload, 'name')) {
+    if (
+      typeof payload.name !== 'string' ||
+      payload.name.trim().length === 0 ||
+      payload.name.trim().length > 200
+    ) {
+      return null;
+    }
+    parsed.name = payload.name.trim();
+  }
+  for (const [field, maxLength] of [
+    ['unit_code', 100],
+    ['floor', 50],
+  ] as const) {
+    if (!Object.hasOwn(payload, field)) continue;
+    const fieldValue = payload[field];
+    if (
+      fieldValue !== null &&
+      (typeof fieldValue !== 'string' || fieldValue.length > maxLength)
+    ) {
+      return null;
+    }
+    parsed[field] =
+      typeof fieldValue === 'string' ? fieldValue.trim() || null : null;
+  }
+  if (Object.hasOwn(payload, 'area_sqm')) {
+    const area = payload.area_sqm;
+    if (area !== null) {
+      if (
+        (typeof area !== 'string' && typeof area !== 'number') ||
+        !/^(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?$/.test(String(area)) ||
+        Number(area) <= 0
+      ) {
+        return null;
+      }
+      parsed.area_sqm = String(area);
+    } else {
+      parsed.area_sqm = null;
+    }
   }
   if (Object.hasOwn(payload, 'status')) {
     if (payload.status !== 'active' && payload.status !== 'inactive') {
@@ -1056,6 +1173,77 @@ export function createPortfolioHandlers(
     }
   }
 
+  async function getUnitWritePermissions(request: Request): Promise<Response> {
+    const organizationId = requestedOrganizationId(new URL(request.url));
+    if (!organizationId) {
+      return errorResponse(400, 'Invalid unit permissions request.');
+    }
+    try {
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const upstreamUrl = new URL('/api/v1/unit-write-permissions', config.baseUrl);
+      upstreamUrl.searchParams.set('organization_id', organizationId);
+      const upstream = await fetcher(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Organization access denied.');
+      }
+      if (upstream.status !== 200 || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (
+        !upstream.headers
+          .get('content-type')
+          ?.toLowerCase()
+          .includes('application/json')
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      let payload: unknown;
+      try {
+        payload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      if (
+        payload === null ||
+        typeof payload !== 'object' ||
+        Array.isArray(payload) ||
+        Object.keys(payload).length !== 2 ||
+        typeof (payload as Record<string, unknown>).can_create !== 'boolean' ||
+        typeof (payload as Record<string, unknown>).can_update !== 'boolean'
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(
+        {
+          can_create: (payload as Record<string, boolean>).can_create,
+          can_update: (payload as Record<string, boolean>).can_update,
+        },
+        { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } },
+      );
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
   async function writeSite(
     request: Request,
     method: 'POST' | 'PATCH',
@@ -1292,6 +1480,128 @@ export function createPortfolioHandlers(
     }
   }
 
+  async function writeUnit(
+    request: Request,
+    method: 'POST' | 'PATCH',
+    unitId?: string,
+  ): Promise<Response> {
+    const identifiers = requestedUnitIdentifiers(new URL(request.url));
+    if (
+      !identifiers ||
+      (method === 'POST' && unitId !== undefined) ||
+      (method === 'PATCH' &&
+        (unitId === undefined || !UUID_PATTERN.test(unitId)))
+    ) {
+      return errorResponse(400, 'Invalid unit request.');
+    }
+    try {
+      const appOrigin = (dependencies.appOrigin ?? loadAppOrigin)();
+      if (!isSameOriginWriteRequest(request, appOrigin)) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      let rawPayload: unknown;
+      try {
+        rawPayload = await readWriteRequestBody(request);
+      } catch {
+        return errorResponse(400, 'Invalid unit request.');
+      }
+      const payload = parseEditableUnitPayload(rawPayload, method === 'PATCH');
+      if (!payload) return errorResponse(400, 'Invalid unit request.');
+
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const upstreamUrl = new URL(
+        unitId === undefined
+          ? '/api/v1/units'
+          : `/api/v1/units/${encodeURIComponent(unitId)}`,
+        config.baseUrl,
+      );
+      upstreamUrl.searchParams.set('organization_id', identifiers.organizationId);
+      if (method === 'PATCH') {
+        upstreamUrl.searchParams.set('portfolio_id', identifiers.portfolioId);
+        upstreamUrl.searchParams.set('site_id', identifiers.siteId);
+        upstreamUrl.searchParams.set('building_id', identifiers.buildingId);
+      }
+      const upstreamPayload =
+        method === 'POST'
+          ? {
+              ...payload,
+              portfolio_id: identifiers.portfolioId,
+              site_id: identifiers.siteId,
+              building_id: identifiers.buildingId,
+            }
+          : payload;
+      const upstream = await fetcher(upstreamUrl, {
+        method,
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        body: JSON.stringify(upstreamPayload),
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Unit write access denied.');
+      }
+      if (upstream.status === 404) {
+        return errorResponse(404, 'Unit or parent asset not found.');
+      }
+      if (upstream.status === 422) {
+        return errorResponse(400, 'Invalid unit request.');
+      }
+      const expectedStatus = method === 'POST' ? 201 : 200;
+      if (upstream.status !== expectedStatus || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (
+        !upstream.headers
+          .get('content-type')
+          ?.toLowerCase()
+          .includes('application/json')
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      let responsePayload: unknown;
+      try {
+        responsePayload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      const unit = parseHierarchyAsset(
+        responsePayload,
+        'unit',
+        identifiers.organizationId,
+        {
+          portfolioId: identifiers.portfolioId,
+          siteId: identifiers.siteId,
+          buildingId: identifiers.buildingId,
+          ...(unitId === undefined ? {} : { resourceId: unitId }),
+        },
+      );
+      if (!unit || !('building_id' in unit)) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(unit, {
+        status: expectedStatus,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
   async function writePortfolio(
     request: Request,
     method: 'POST' | 'PATCH',
@@ -1407,6 +1717,9 @@ export function createPortfolioHandlers(
     getBuildingWritePermissions(request: Request): Promise<Response> {
       return getBuildingWritePermissions(request);
     },
+    getUnitWritePermissions(request: Request): Promise<Response> {
+      return getUnitWritePermissions(request);
+    },
     createPortfolio(request: Request): Promise<Response> {
       return writePortfolio(request, 'POST');
     },
@@ -1424,6 +1737,41 @@ export function createPortfolioHandlers(
     },
     updateBuilding(request: Request, buildingId: string): Promise<Response> {
       return writeBuilding(request, 'PATCH', buildingId);
+    },
+    createUnit(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+      buildingId: string,
+    ): Promise<Response> {
+      const identifiers = requestedUnitIdentifiers(new URL(request.url));
+      if (
+        !identifiers ||
+        identifiers.portfolioId !== portfolioId ||
+        identifiers.siteId !== siteId ||
+        identifiers.buildingId !== buildingId
+      ) {
+        return Promise.resolve(errorResponse(400, 'Invalid unit request.'));
+      }
+      return writeUnit(request, 'POST');
+    },
+    updateUnit(
+      request: Request,
+      portfolioId: string,
+      siteId: string,
+      buildingId: string,
+      unitId: string,
+    ): Promise<Response> {
+      const identifiers = requestedUnitIdentifiers(new URL(request.url));
+      if (
+        !identifiers ||
+        identifiers.portfolioId !== portfolioId ||
+        identifiers.siteId !== siteId ||
+        identifiers.buildingId !== buildingId
+      ) {
+        return Promise.resolve(errorResponse(400, 'Invalid unit request.'));
+      }
+      return writeUnit(request, 'PATCH', unitId);
     },
     async getPortfolios(request: Request): Promise<Response> {
       const organizationId = requestedOrganizationId(new URL(request.url));

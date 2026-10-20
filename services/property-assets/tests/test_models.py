@@ -36,6 +36,7 @@ def test_portfolio_table_and_uuid_primary_key_are_declared():
         "portfolio_audit_events",
         "site_audit_events",
         "building_audit_events",
+        "unit_audit_events",
         "sites",
         "buildings",
         "units",

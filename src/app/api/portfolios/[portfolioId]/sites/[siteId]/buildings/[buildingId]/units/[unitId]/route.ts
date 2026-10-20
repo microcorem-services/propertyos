@@ -20,3 +20,20 @@ export async function GET(
     sessions: () => getAuthSessionManagers().authenticated,
   }).getUnit(request, portfolioId, siteId, buildingId, unitId);
 }
+
+export async function PATCH(
+  request: Request,
+  context: {
+    params: Promise<{
+      portfolioId: string;
+      siteId: string;
+      buildingId: string;
+      unitId: string;
+    }>;
+  },
+): Promise<Response> {
+  const { portfolioId, siteId, buildingId, unitId } = await context.params;
+  return createPortfolioHandlers({
+    sessions: () => getAuthSessionManagers().authenticated,
+  }).updateUnit(request, portfolioId, siteId, buildingId, unitId);
+}
