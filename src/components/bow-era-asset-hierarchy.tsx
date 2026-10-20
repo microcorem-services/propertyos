@@ -13,6 +13,7 @@ import {
   fetchBuilding,
   fetchBuildings,
   fetchSite,
+  fetchSiteWritePermissions,
   fetchSites,
   fetchUnit,
   fetchUnits,
@@ -111,6 +112,9 @@ export function SiteCollection({
   const [sites, setSites] = useState<Site[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<PortfoliosRequestError | null>(null);
+  const [canCreate, setCanCreate] = useState(false);
+  const [permissionVerified, setPermissionVerified] = useState(false);
+  const [permissionFailed, setPermissionFailed] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -137,6 +141,21 @@ export function SiteCollection({
     };
   }, [portfolioId, organizationId]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchSiteWritePermissions(organizationId, controller.signal)
+      .then((permissions) => {
+        if (!controller.signal.aborted) setCanCreate(permissions.can_create);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setPermissionFailed(true);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPermissionVerified(true);
+      });
+    return () => controller.abort();
+  }, [organizationId]);
+
   if (loading) return <LoadingState label="Retrieving sites securely…" />;
   if (error) {
     return (
@@ -153,9 +172,24 @@ export function SiteCollection({
           <p className="bow-era-eyebrow">Property hierarchy</p>
           <h2 id="site-list-title">Sites</h2>
         </div>
-        <p className="bowera-portfolio-count">
-          {sites.length} {sites.length === 1 ? 'site' : 'sites'}
-        </p>
+        <div className="bowera-editor-action-row">
+          <p className="bowera-portfolio-count">
+            {sites.length} {sites.length === 1 ? 'site' : 'sites'}
+          </p>
+          {permissionVerified && canCreate && (
+            <Link
+              className="bow-era-button bow-era-button-secondary"
+              href={`/portfolio/${encodeURIComponent(portfolioId)}/sites/new?organizationId=${encodeURIComponent(organizationId)}`}
+            >
+              Add site
+            </Link>
+          )}
+          {permissionVerified && permissionFailed && (
+            <span className="bowera-editor-permission-note" role="status">
+              Site creation permissions could not be verified.
+            </span>
+          )}
+        </div>
       </div>
       <SiteCards
         sites={sites}
@@ -290,6 +324,46 @@ function ChildCards({
               <span className="bowera-asset-card-action">View unit details</span>
             </Link>
           )) : null}
+    </div>
+  );
+}
+
+function SiteEditAction({
+  portfolioId,
+  siteId,
+  organizationId,
+}: {
+  portfolioId: string;
+  siteId: string;
+  organizationId: string;
+}) {
+  const [canUpdate, setCanUpdate] = useState(false);
+  const [verified, setVerified] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchSiteWritePermissions(organizationId, controller.signal)
+      .then((permissions) => {
+        if (!controller.signal.aborted) setCanUpdate(permissions.can_update);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setVerified(true);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setVerified(true);
+      });
+    return () => controller.abort();
+  }, [organizationId]);
+
+  if (!verified || !canUpdate) return null;
+  return (
+    <div className="bowera-editor-action-row">
+      <Link
+        className="bow-era-button bow-era-button-secondary"
+        href={`/portfolio/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/edit?organizationId=${encodeURIComponent(organizationId)}`}
+      >
+        Edit site
+      </Link>
     </div>
   );
 }
@@ -484,6 +558,13 @@ export function AssetDetailPage({
                 <p className="bow-era-description">
                   Verified {level} details and its place in the portfolio.
                 </p>
+                {level === 'site' && organizationId && (
+                  <SiteEditAction
+                    organizationId={organizationId}
+                    portfolioId={portfolioId}
+                    siteId={siteId}
+                  />
+                )}
               </div>
               <AssetDetails asset={data.asset} level={level} />
               {level === 'site' && organizationId && (

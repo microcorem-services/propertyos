@@ -61,6 +61,8 @@ class InternalAuthorizationDecisionRequest(BaseModel):
         "property-assets.portfolios.read",
         "property-assets.portfolios.create",
         "property-assets.portfolios.update",
+        "property-assets.sites.create",
+        "property-assets.sites.update",
     ]
 
 
@@ -70,6 +72,8 @@ class InternalAuthorizationDecisionResponse(BaseModel):
         "property-assets.portfolios.read",
         "property-assets.portfolios.create",
         "property-assets.portfolios.update",
+        "property-assets.sites.create",
+        "property-assets.sites.update",
     ]
     allowed: Literal[True]
     actor_id: UUID

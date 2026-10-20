@@ -909,6 +909,12 @@ def test_internal_decision_requires_active_member_and_both_credentials(
         ("property-assets.portfolios.update", MembershipRole.ADMIN, 200),
         ("property-assets.portfolios.create", MembershipRole.OWNER, 200),
         ("property-assets.portfolios.update", MembershipRole.OWNER, 200),
+        ("property-assets.sites.create", MembershipRole.MEMBER, 403),
+        ("property-assets.sites.update", MembershipRole.MEMBER, 403),
+        ("property-assets.sites.create", MembershipRole.ADMIN, 200),
+        ("property-assets.sites.update", MembershipRole.ADMIN, 200),
+        ("property-assets.sites.create", MembershipRole.OWNER, 200),
+        ("property-assets.sites.update", MembershipRole.OWNER, 200),
     ],
 )
 def test_internal_portfolio_operations_enforce_membership_roles(

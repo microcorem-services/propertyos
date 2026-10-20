@@ -14,15 +14,24 @@ from app import config
 from app.workload_token import WorkloadTokenError, get_workload_access_token
 
 
-PortfolioOperation = Literal[
+AuthorizationOperation = Literal[
     "property-assets.portfolios.read",
     "property-assets.portfolios.create",
     "property-assets.portfolios.update",
+    "property-assets.sites.create",
+    "property-assets.sites.update",
 ]
-READ_OPERATION: PortfolioOperation = "property-assets.portfolios.read"
-CREATE_OPERATION: PortfolioOperation = "property-assets.portfolios.create"
-UPDATE_OPERATION: PortfolioOperation = "property-assets.portfolios.update"
-WRITE_OPERATIONS = (CREATE_OPERATION, UPDATE_OPERATION)
+READ_OPERATION: AuthorizationOperation = "property-assets.portfolios.read"
+CREATE_OPERATION: AuthorizationOperation = "property-assets.portfolios.create"
+UPDATE_OPERATION: AuthorizationOperation = "property-assets.portfolios.update"
+CREATE_SITE_OPERATION: AuthorizationOperation = "property-assets.sites.create"
+UPDATE_SITE_OPERATION: AuthorizationOperation = "property-assets.sites.update"
+WRITE_OPERATIONS = (
+    CREATE_OPERATION,
+    UPDATE_OPERATION,
+    CREATE_SITE_OPERATION,
+    UPDATE_SITE_OPERATION,
+)
 DECISION_PATH = "/internal/v1/authorization/decisions"
 _JWT_ACCESS_TOKEN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 
@@ -47,6 +56,12 @@ class AuthorizedOrganization:
 
 @dataclass(frozen=True)
 class PortfolioWritePermissions:
+    can_create: bool
+    can_update: bool
+
+
+@dataclass(frozen=True)
+class SiteWritePermissions:
     can_create: bool
     can_update: bool
 
@@ -115,7 +130,7 @@ def require_organization_authorization(
     organization_id: UUID,
     user_token: str,
     workload_token: str,
-    operation: PortfolioOperation = READ_OPERATION,
+    operation: AuthorizationOperation = READ_OPERATION,
 ) -> AuthorizedOrganization:
     decision_url = _decision_url()
     try:
@@ -203,7 +218,7 @@ def get_authorized_organization(
     )
 
 
-def portfolio_write_authorization(operation: PortfolioOperation):
+def write_authorization(operation: AuthorizationOperation):
     if operation not in WRITE_OPERATIONS:
         raise ValueError("A portfolio write operation is required.")
 
@@ -234,7 +249,7 @@ def get_portfolio_write_permissions(
         READ_OPERATION,
     )
 
-    def allowed(operation: PortfolioOperation) -> bool:
+    def allowed(operation: AuthorizationOperation) -> bool:
         try:
             require_organization_authorization(
                 organization_id,
@@ -249,4 +264,34 @@ def get_portfolio_write_permissions(
     return PortfolioWritePermissions(
         can_create=allowed(CREATE_OPERATION),
         can_update=allowed(UPDATE_OPERATION),
+    )
+
+
+def get_site_write_permissions(
+    organization_id: UUID,
+    user_token: str,
+    workload_token: str,
+) -> SiteWritePermissions:
+    require_organization_authorization(
+        organization_id,
+        user_token,
+        workload_token,
+        READ_OPERATION,
+    )
+
+    def allowed(operation: AuthorizationOperation) -> bool:
+        try:
+            require_organization_authorization(
+                organization_id,
+                user_token,
+                workload_token,
+                operation,
+            )
+        except OrganizationAccessDenied:
+            return False
+        return True
+
+    return SiteWritePermissions(
+        can_create=allowed(CREATE_SITE_OPERATION),
+        can_update=allowed(UPDATE_SITE_OPERATION),
     )

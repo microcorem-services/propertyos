@@ -41,6 +41,36 @@ class PortfolioUpdateRequest(BaseModel):
         return self
 
 
+class SiteWriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    portfolio_id: UUID
+    name: str = Field(min_length=1, max_length=200)
+    address: str | None = Field(default=None, max_length=1000)
+    status: Literal["active", "inactive"] = "active"
+
+
+class SiteUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    address: str | None = Field(default=None, max_length=1000)
+    status: Literal["active", "inactive"] | None = None
+
+    @field_validator("name", "status")
+    @classmethod
+    def reject_null_values(cls, value):
+        if value is None:
+            raise ValueError("Fields cannot be null.")
+        return value
+
+    @model_validator(mode="after")
+    def require_editable_fields(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one editable field is required.")
+        return self
+
+
 class PortfolioResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -53,6 +83,11 @@ class PortfolioResponse(BaseModel):
 
 
 class PortfolioWritePermissionsResponse(BaseModel):
+    can_create: bool
+    can_update: bool
+
+
+class SiteWritePermissionsResponse(BaseModel):
     can_create: bool
     can_update: bool
 

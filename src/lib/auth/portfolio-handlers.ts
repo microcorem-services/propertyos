@@ -172,6 +172,33 @@ function requestedOrganizationId(requestUrl: URL): string | null {
   return values[0];
 }
 
+function requestedSiteIdentifiers(
+  requestUrl: URL,
+): { organizationId: string; portfolioId: string } | null {
+  const keys = [...requestUrl.searchParams.keys()].sort();
+  if (
+    keys.length !== 2 ||
+    keys[0] !== 'organizationId' ||
+    keys[1] !== 'portfolioId'
+  ) {
+    return null;
+  }
+  const organizationIds = requestUrl.searchParams.getAll('organizationId');
+  const portfolioIds = requestUrl.searchParams.getAll('portfolioId');
+  if (
+    organizationIds.length !== 1 ||
+    portfolioIds.length !== 1 ||
+    !UUID_PATTERN.test(organizationIds[0]) ||
+    !UUID_PATTERN.test(portfolioIds[0])
+  ) {
+    return null;
+  }
+  return {
+    organizationId: organizationIds[0],
+    portfolioId: portfolioIds[0],
+  };
+}
+
 async function readAccessToken(
   request: Request,
   sessions: () => PortfolioSessionManager,
@@ -469,6 +496,56 @@ function parseEditablePortfolioPayload(
   return parsed;
 }
 
+function parseEditableSitePayload(
+  value: unknown,
+  patch: boolean,
+): { name?: string; address?: string | null; status?: 'active' | 'inactive' } | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const payload = value as Record<string, unknown>;
+  const keys = Object.keys(payload);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => !['name', 'address', 'status'].includes(key)) ||
+    (!patch && !Object.hasOwn(payload, 'name'))
+  ) {
+    return null;
+  }
+  const parsed: {
+    name?: string;
+    address?: string | null;
+    status?: 'active' | 'inactive';
+  } = {};
+  if (Object.hasOwn(payload, 'name')) {
+    if (
+      typeof payload.name !== 'string' ||
+      payload.name.trim().length === 0 ||
+      payload.name.trim().length > 200
+    ) {
+      return null;
+    }
+    parsed.name = payload.name.trim();
+  }
+  if (Object.hasOwn(payload, 'address')) {
+    if (
+      payload.address !== null &&
+      (typeof payload.address !== 'string' || payload.address.length > 1000)
+    ) {
+      return null;
+    }
+    parsed.address =
+      typeof payload.address === 'string' ? payload.address.trim() : null;
+  }
+  if (Object.hasOwn(payload, 'status')) {
+    if (payload.status !== 'active' && payload.status !== 'inactive') {
+      return null;
+    }
+    parsed.status = payload.status;
+  }
+  return parsed;
+}
+
 async function readWriteRequestBody(request: Request): Promise<unknown> {
   const contentType = request.headers.get('content-type')?.toLowerCase();
   if (!contentType || !/^application\/json(?:\s*;|$)/.test(contentType)) {
@@ -740,6 +817,191 @@ export function createPortfolioHandlers(
     }
   }
 
+  async function getSiteWritePermissions(request: Request): Promise<Response> {
+    const organizationId = requestedOrganizationId(new URL(request.url));
+    if (!organizationId) {
+      return errorResponse(400, 'Invalid site permissions request.');
+    }
+    try {
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const upstreamUrl = new URL('/api/v1/site-write-permissions', config.baseUrl);
+      upstreamUrl.searchParams.set('organization_id', organizationId);
+      const upstream = await fetcher(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Organization access denied.');
+      }
+      if (upstream.status !== 200 || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (
+        !upstream.headers
+          .get('content-type')
+          ?.toLowerCase()
+          .includes('application/json')
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      let payload: unknown;
+      try {
+        payload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      if (
+        payload === null ||
+        typeof payload !== 'object' ||
+        Array.isArray(payload) ||
+        Object.keys(payload).length !== 2 ||
+        typeof (payload as Record<string, unknown>).can_create !== 'boolean' ||
+        typeof (payload as Record<string, unknown>).can_update !== 'boolean'
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(
+        {
+          can_create: (payload as Record<string, boolean>).can_create,
+          can_update: (payload as Record<string, boolean>).can_update,
+        },
+        { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } },
+      );
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
+  async function writeSite(
+    request: Request,
+    method: 'POST' | 'PATCH',
+    siteId?: string,
+  ): Promise<Response> {
+    const identifiers = requestedSiteIdentifiers(new URL(request.url));
+    if (
+      !identifiers ||
+      (method === 'POST' && siteId !== undefined) ||
+      (method === 'PATCH' &&
+        (siteId === undefined || !UUID_PATTERN.test(siteId)))
+    ) {
+      return errorResponse(400, 'Invalid site request.');
+    }
+
+    try {
+      const appOrigin = (dependencies.appOrigin ?? loadAppOrigin)();
+      if (!isSameOriginWriteRequest(request, appOrigin)) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      let rawPayload: unknown;
+      try {
+        rawPayload = await readWriteRequestBody(request);
+      } catch {
+        return errorResponse(400, 'Invalid site request.');
+      }
+      const payload = parseEditableSitePayload(rawPayload, method === 'PATCH');
+      if (!payload) return errorResponse(400, 'Invalid site request.');
+
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const upstreamUrl = new URL(
+        siteId === undefined
+          ? '/api/v1/sites'
+          : `/api/v1/sites/${encodeURIComponent(siteId)}`,
+        config.baseUrl,
+      );
+      upstreamUrl.searchParams.set(
+        'organization_id',
+        identifiers.organizationId,
+      );
+      const upstreamPayload =
+        method === 'POST'
+          ? { ...payload, portfolio_id: identifiers.portfolioId }
+          : payload;
+      const upstream = await fetcher(upstreamUrl, {
+        method,
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        body: JSON.stringify(upstreamPayload),
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Site write access denied.');
+      }
+      if (upstream.status === 404) {
+        return errorResponse(404, 'Site or parent portfolio not found.');
+      }
+      if (upstream.status === 422) {
+        return errorResponse(400, 'Invalid site request.');
+      }
+      const expectedStatus = method === 'POST' ? 201 : 200;
+      if (upstream.status !== expectedStatus || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (
+        !upstream.headers
+          .get('content-type')
+          ?.toLowerCase()
+          .includes('application/json')
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      let responsePayload: unknown;
+      try {
+        responsePayload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      const site = parseHierarchyAsset(
+        responsePayload,
+        'site',
+        identifiers.organizationId,
+        {
+          portfolioId: identifiers.portfolioId,
+          ...(siteId === undefined ? {} : { resourceId: siteId }),
+        },
+      );
+      if (!site || !('portfolio_id' in site)) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(site, {
+        status: expectedStatus,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
   async function writePortfolio(
     request: Request,
     method: 'POST' | 'PATCH',
@@ -849,11 +1111,20 @@ export function createPortfolioHandlers(
     getPortfolioWritePermissions(request: Request): Promise<Response> {
       return getWritePermissions(request);
     },
+    getSiteWritePermissions(request: Request): Promise<Response> {
+      return getSiteWritePermissions(request);
+    },
     createPortfolio(request: Request): Promise<Response> {
       return writePortfolio(request, 'POST');
     },
     updatePortfolio(request: Request, portfolioId: string): Promise<Response> {
       return writePortfolio(request, 'PATCH', portfolioId);
+    },
+    createSite(request: Request): Promise<Response> {
+      return writeSite(request, 'POST');
+    },
+    updateSite(request: Request, siteId: string): Promise<Response> {
+      return writeSite(request, 'PATCH', siteId);
     },
     async getPortfolios(request: Request): Promise<Response> {
       const organizationId = requestedOrganizationId(new URL(request.url));

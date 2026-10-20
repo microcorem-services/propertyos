@@ -32,6 +32,12 @@ The Registry owns `portfolio_audit_events`. Successful mutations and their audit
 
 The same-origin Next.js BFF provides `GET /api/portfolio-write-permissions?organizationId=<UUID>`, `POST /api/portfolios?organizationId=<UUID>`, and `PATCH /api/portfolios/{portfolioId}?organizationId=<UUID>`. Its cookie-authenticated write handlers require the request `Origin` to exactly match `APP_ORIGIN`; they keep Cognito tokens server-side, restrict upstream destinations to the configured Registry origin, bound request size and time, reject redirects, and return no-store sanitized responses.
 
+## Site writes and audit trail
+
+The Registry exposes `POST /api/v1/sites?organization_id=<UUID>` and `PATCH /api/v1/sites/{site_id}?organization_id=<UUID>`. Site creation requires a `portfolio_id` belonging to the authorized organization; updates cannot change the portfolio or organization. Only `name`, `address`, and `status` are editable. Organization & Access grants `property-assets.sites.create` and `property-assets.sites.update` only to active owners and admins; each Registry mutation independently requests its matching decision.
+
+Successful mutations and their `site_audit_events` rows share one transaction. Audit rows include organization, site, operation, trusted actor ID, timestamp, and permitted changed-field names, but no field values, credentials, or tokens. Apply migration `0006_site_audit` before enabling these routes. The Next.js BFF exposes `GET /api/site-write-permissions?organizationId=<UUID>`, `POST /api/sites?organizationId=<UUID>&portfolioId=<UUID>`, and `PATCH /api/sites/{siteId}?organizationId=<UUID>&portfolioId=<UUID>`; write protections match the portfolio BFF.
+
 ## Protected property hierarchy
 
 The following read-only endpoints use the same user authentication and `property-assets.portfolios.read` organization decision:

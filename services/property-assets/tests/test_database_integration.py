@@ -313,13 +313,14 @@ def test_initial_migration_can_upgrade_and_downgrade(integration_database):
         assert {
             "portfolios",
             "portfolio_audit_events",
+            "site_audit_events",
             "sites",
             "buildings",
             "units",
         } <= set(inspect(connection).get_table_names())
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == "0005_portfolio_audit"
+        ).scalar_one() == "0006_site_audit"
 
     _run_alembic(schema_url, "downgrade", "0003_buildings")
     with engine.connect() as connection:
@@ -329,6 +330,7 @@ def test_initial_migration_can_upgrade_and_downgrade(integration_database):
         assert "buildings" in table_names
         assert "units" not in table_names
         assert "portfolio_audit_events" not in table_names
+        assert "site_audit_events" not in table_names
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
         ).scalar_one() == "0003_buildings"
@@ -338,13 +340,14 @@ def test_initial_migration_can_upgrade_and_downgrade(integration_database):
         assert {
             "portfolios",
             "portfolio_audit_events",
+            "site_audit_events",
             "sites",
             "buildings",
             "units",
         } <= set(inspect(connection).get_table_names())
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == "0005_portfolio_audit"
+        ).scalar_one() == "0006_site_audit"
 
 
 def test_site_can_be_created_with_its_portfolio(session: Session):

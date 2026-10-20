@@ -14,24 +14,37 @@ from app.authorization import (
     AuthorizationDependencyUnavailable,
     AuthorizedOrganization,
     CREATE_OPERATION,
+    CREATE_SITE_OPERATION,
     OrganizationAccessDenied,
     UPDATE_OPERATION,
+    UPDATE_SITE_OPERATION,
     UserAuthenticationRequired,
     get_authorization_workload_token,
     get_authorized_organization,
     get_portfolio_write_permissions,
+    get_site_write_permissions,
     get_user_bearer_token,
-    portfolio_write_authorization,
+    write_authorization,
 )
 from app.config import SERVICE_NAME
-from app.models import Building, Portfolio, PortfolioAuditEvent, Site, Unit
+from app.models import (
+    Building,
+    Portfolio,
+    PortfolioAuditEvent,
+    Site,
+    SiteAuditEvent,
+    Unit,
+)
 from app.schemas import (
     BuildingResponse,
     PortfolioResponse,
     PortfolioUpdateRequest,
     PortfolioWritePermissionsResponse,
     PortfolioWriteRequest,
+    SiteUpdateRequest,
     SiteResponse,
+    SiteWritePermissionsResponse,
+    SiteWriteRequest,
     UnitResponse,
 )
 
@@ -44,8 +57,10 @@ class PropertyDatabaseUnavailable(Exception):
     pass
 
 
-_create_portfolio_authorization = portfolio_write_authorization(CREATE_OPERATION)
-_update_portfolio_authorization = portfolio_write_authorization(UPDATE_OPERATION)
+_create_portfolio_authorization = write_authorization(CREATE_OPERATION)
+_update_portfolio_authorization = write_authorization(UPDATE_OPERATION)
+_create_site_authorization = write_authorization(CREATE_SITE_OPERATION)
+_update_site_authorization = write_authorization(UPDATE_SITE_OPERATION)
 
 
 def get_portfolio_session() -> Generator[Session, None, None]:
@@ -196,6 +211,22 @@ def portfolio_write_permissions(
     )
 
 
+@api_router.get(
+    "/site-write-permissions",
+    response_model=SiteWritePermissionsResponse,
+)
+def site_write_permissions(
+    organization_id: UUID = Query(...),
+    user_token: str = Depends(get_user_bearer_token),
+    workload_token: str = Depends(get_authorization_workload_token),
+):
+    return get_site_write_permissions(
+        organization_id,
+        user_token,
+        workload_token,
+    )
+
+
 @api_router.post(
     "/portfolios",
     response_model=PortfolioResponse,
@@ -277,6 +308,96 @@ def update_portfolio(
     except SQLAlchemyError:
         raise PropertyDatabaseUnavailable from None
     return portfolio
+
+
+@api_router.post(
+    "/sites",
+    response_model=SiteResponse,
+    status_code=201,
+)
+def create_site(
+    payload: SiteWriteRequest,
+    _authorization: AuthorizedOrganization = Depends(_create_site_authorization),
+    session: Session = Depends(get_portfolio_session),
+) -> Site:
+    try:
+        with session.begin():
+            portfolio_exists = session.scalar(
+                select(Portfolio.id).where(
+                    Portfolio.id == payload.portfolio_id,
+                    Portfolio.organization_id == _authorization.organization_id,
+                )
+            )
+            if portfolio_exists is None:
+                raise HTTPException(status_code=404, detail="Asset not found")
+
+            site = Site(
+                organization_id=_authorization.organization_id,
+                portfolio_id=payload.portfolio_id,
+                name=payload.name,
+                address=payload.address,
+                status=payload.status,
+            )
+            session.add(site)
+            session.flush()
+            session.add(
+                SiteAuditEvent(
+                    organization_id=_authorization.organization_id,
+                    site_id=site.id,
+                    operation=CREATE_SITE_OPERATION,
+                    actor_id=_authorization.actor_id,
+                    changed_fields=["address", "name", "status"],
+                )
+            )
+            session.flush()
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
+    return site
+
+
+@api_router.patch(
+    "/sites/{site_id}",
+    response_model=SiteResponse,
+)
+def update_site(
+    site_id: UUID,
+    payload: SiteUpdateRequest,
+    _authorization: AuthorizedOrganization = Depends(_update_site_authorization),
+    session: Session = Depends(get_portfolio_session),
+) -> Site:
+    updates = payload.model_dump(exclude_unset=True)
+    try:
+        with session.begin():
+            site = session.scalar(
+                select(Site).where(
+                    Site.id == site_id,
+                    Site.organization_id == _authorization.organization_id,
+                )
+            )
+            if site is None:
+                raise HTTPException(status_code=404, detail="Asset not found")
+
+            changed_fields = sorted(
+                field
+                for field, value in updates.items()
+                if value != getattr(site, field)
+            )
+            for field, value in updates.items():
+                setattr(site, field, value)
+            site.updated_at = datetime.now(UTC)
+            session.add(
+                SiteAuditEvent(
+                    organization_id=_authorization.organization_id,
+                    site_id=site.id,
+                    operation=UPDATE_SITE_OPERATION,
+                    actor_id=_authorization.actor_id,
+                    changed_fields=changed_fields,
+                )
+            )
+            session.flush()
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
+    return site
 
 
 @api_router.get(

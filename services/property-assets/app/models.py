@@ -179,6 +179,40 @@ class Site(Base):
     buildings: Mapped[list["Building"]] = relationship(back_populates="site")
 
 
+class SiteAuditEvent(Base):
+    __tablename__ = "site_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('property-assets.sites.create', "
+            "'property-assets.sites.update')",
+            name="ck_site_audit_operation",
+        ),
+        Index(
+            "ix_site_audit_organization_site",
+            "organization_id",
+            "site_id",
+        ),
+        Index("ix_site_audit_occurred_at", "occurred_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    site_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+
+
 class BuildingStatus(StrEnum):
     ACTIVE = "active"
     INACTIVE = "inactive"
