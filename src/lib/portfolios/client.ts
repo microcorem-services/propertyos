@@ -53,6 +53,11 @@ export type SiteWritePermissions = {
   can_update: boolean;
 };
 
+export type BuildingWritePermissions = {
+  can_create: boolean;
+  can_update: boolean;
+};
+
 export type PortfolioEditableFields = {
   name: string;
   status: 'active' | 'inactive';
@@ -66,6 +71,20 @@ export type SiteEditableFields = {
 
 export type SiteUpdateFields = {
   name?: string;
+  address?: string | null;
+  status?: 'active' | 'inactive';
+};
+
+export type BuildingEditableFields = {
+  name: string;
+  building_code?: string | null;
+  address?: string | null;
+  status: 'active' | 'inactive';
+};
+
+export type BuildingUpdateFields = {
+  name?: string;
+  building_code?: string | null;
   address?: string | null;
   status?: 'active' | 'inactive';
 };
@@ -801,6 +820,67 @@ export async function fetchSiteWritePermissions(
   }
 }
 
+export async function fetchBuildingWritePermissions(
+  organizationId: string,
+  signal?: AbortSignal,
+): Promise<BuildingWritePermissions> {
+  if (!UUID_PATTERN.test(organizationId)) {
+    throw new PortfoliosRequestError('Choose a valid organisation first.', 400);
+  }
+  let response: Response;
+  try {
+    const query = new URLSearchParams({ organizationId });
+    response = await fetch(`/api/building-write-permissions?${query}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: { Accept: 'application/json' },
+      signal,
+    });
+  } catch {
+    throw new PortfoliosRequestError(
+      'Building permissions could not be reached. Please try again.',
+      0,
+    );
+  }
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have access to this organisation.',
+      403,
+    );
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      'Building permissions could not be verified.',
+      response.status,
+    );
+  }
+  try {
+    const payload: unknown = await response.json();
+    if (
+      !isRecord(payload) ||
+      Object.keys(payload).length !== 2 ||
+      typeof payload.can_create !== 'boolean' ||
+      typeof payload.can_update !== 'boolean'
+    ) {
+      throw new TypeError();
+    }
+    return {
+      can_create: payload.can_create,
+      can_update: payload.can_update,
+    };
+  } catch {
+    throw new PortfoliosRequestError(
+      'Building permissions could not be verified.',
+      502,
+    );
+  }
+}
+
 async function writeSite(
   method: 'POST' | 'PATCH',
   portfolioId: string,
@@ -916,6 +996,140 @@ export function updateSite(
   fields: SiteUpdateFields,
 ): Promise<Site> {
   return writeSite('PATCH', portfolioId, organizationId, fields, siteId);
+}
+
+async function writeBuilding(
+  method: 'POST' | 'PATCH',
+  portfolioId: string,
+  siteId: string,
+  organizationId: string,
+  fields: BuildingEditableFields | BuildingUpdateFields,
+  buildingId?: string,
+): Promise<Building> {
+  if (
+    ![portfolioId, siteId, organizationId].every((id) => UUID_PATTERN.test(id)) ||
+    (method === 'PATCH' &&
+      (!buildingId || !UUID_PATTERN.test(buildingId))) ||
+    (method === 'POST' && buildingId !== undefined)
+  ) {
+    throw new PortfoliosRequestError('Choose a valid building first.', 400);
+  }
+  const keys = Object.keys(fields);
+  const name = fields.name?.trim();
+  if (
+    keys.length === 0 ||
+    keys.some(
+      (key) =>
+        !['name', 'building_code', 'address', 'status'].includes(key),
+    ) ||
+    (fields.name !== undefined && (!name || name.length > 200)) ||
+    (fields.building_code !== undefined &&
+      fields.building_code !== null &&
+      (typeof fields.building_code !== 'string' ||
+        fields.building_code.length > 100)) ||
+    (fields.address !== undefined &&
+      fields.address !== null &&
+      (typeof fields.address !== 'string' || fields.address.length > 1000)) ||
+    (fields.status !== undefined &&
+      fields.status !== 'active' &&
+      fields.status !== 'inactive') ||
+    (method === 'POST' && !name)
+  ) {
+    throw new PortfoliosRequestError('Enter valid building details.', 400);
+  }
+
+  const body: BuildingUpdateFields = { ...fields };
+  if (fields.name !== undefined) body.name = name;
+  if (typeof fields.building_code === 'string') {
+    body.building_code = fields.building_code.trim() || null;
+  }
+  if (typeof fields.address === 'string') body.address = fields.address.trim() || null;
+  const query = new URLSearchParams({ organizationId, portfolioId, siteId });
+  const path =
+    method === 'POST'
+      ? `/api/buildings?${query}`
+      : `/api/buildings/${encodeURIComponent(buildingId ?? '')}?${query}`;
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new PortfoliosRequestError(
+      'Building changes could not be submitted. Please try again.',
+      0,
+    );
+  }
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have permission to change buildings.',
+      403,
+    );
+  }
+  if (response.status === 404) {
+    throw new PortfoliosRequestError('Building or parent asset not found.', 404);
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      response.status === 503
+        ? 'The property service is temporarily unavailable. Please try again.'
+        : 'Building details could not be saved. Please review your changes.',
+      response.status,
+    );
+  }
+  try {
+    const asset = parseAsset(
+      await response.json(),
+      'building',
+      organizationId,
+      { portfolioId, siteId },
+      buildingId,
+    );
+    if (!('site_id' in asset)) throw new TypeError();
+    return asset;
+  } catch {
+    throw new PortfoliosRequestError(
+      'The saved building could not be verified.',
+      502,
+    );
+  }
+}
+
+export function createBuilding(
+  portfolioId: string,
+  siteId: string,
+  organizationId: string,
+  fields: BuildingEditableFields,
+): Promise<Building> {
+  return writeBuilding('POST', portfolioId, siteId, organizationId, fields);
+}
+
+export function updateBuilding(
+  buildingId: string,
+  portfolioId: string,
+  siteId: string,
+  organizationId: string,
+  fields: BuildingUpdateFields,
+): Promise<Building> {
+  return writeBuilding(
+    'PATCH',
+    portfolioId,
+    siteId,
+    organizationId,
+    fields,
+    buildingId,
+  );
 }
 
 export function fetchSites(

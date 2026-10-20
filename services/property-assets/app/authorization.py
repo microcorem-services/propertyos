@@ -20,17 +20,23 @@ AuthorizationOperation = Literal[
     "property-assets.portfolios.update",
     "property-assets.sites.create",
     "property-assets.sites.update",
+    "property-assets.buildings.create",
+    "property-assets.buildings.update",
 ]
 READ_OPERATION: AuthorizationOperation = "property-assets.portfolios.read"
 CREATE_OPERATION: AuthorizationOperation = "property-assets.portfolios.create"
 UPDATE_OPERATION: AuthorizationOperation = "property-assets.portfolios.update"
 CREATE_SITE_OPERATION: AuthorizationOperation = "property-assets.sites.create"
 UPDATE_SITE_OPERATION: AuthorizationOperation = "property-assets.sites.update"
+CREATE_BUILDING_OPERATION: AuthorizationOperation = "property-assets.buildings.create"
+UPDATE_BUILDING_OPERATION: AuthorizationOperation = "property-assets.buildings.update"
 WRITE_OPERATIONS = (
     CREATE_OPERATION,
     UPDATE_OPERATION,
     CREATE_SITE_OPERATION,
     UPDATE_SITE_OPERATION,
+    CREATE_BUILDING_OPERATION,
+    UPDATE_BUILDING_OPERATION,
 )
 DECISION_PATH = "/internal/v1/authorization/decisions"
 _JWT_ACCESS_TOKEN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
@@ -62,6 +68,12 @@ class PortfolioWritePermissions:
 
 @dataclass(frozen=True)
 class SiteWritePermissions:
+    can_create: bool
+    can_update: bool
+
+
+@dataclass(frozen=True)
+class BuildingWritePermissions:
     can_create: bool
     can_update: bool
 
@@ -294,4 +306,34 @@ def get_site_write_permissions(
     return SiteWritePermissions(
         can_create=allowed(CREATE_SITE_OPERATION),
         can_update=allowed(UPDATE_SITE_OPERATION),
+    )
+
+
+def get_building_write_permissions(
+    organization_id: UUID,
+    user_token: str,
+    workload_token: str,
+) -> BuildingWritePermissions:
+    require_organization_authorization(
+        organization_id,
+        user_token,
+        workload_token,
+        READ_OPERATION,
+    )
+
+    def allowed(operation: AuthorizationOperation) -> bool:
+        try:
+            require_organization_authorization(
+                organization_id,
+                user_token,
+                workload_token,
+                operation,
+            )
+        except OrganizationAccessDenied:
+            return False
+        return True
+
+    return BuildingWritePermissions(
+        can_create=allowed(CREATE_BUILDING_OPERATION),
+        can_update=allowed(UPDATE_BUILDING_OPERATION),
     )

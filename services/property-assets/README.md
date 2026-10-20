@@ -38,6 +38,12 @@ The Registry exposes `POST /api/v1/sites?organization_id=<UUID>` and `PATCH /api
 
 Successful mutations and their `site_audit_events` rows share one transaction. Audit rows include organization, site, operation, trusted actor ID, timestamp, and permitted changed-field names, but no field values, credentials, or tokens. Apply migration `0006_site_audit` before enabling these routes. The Next.js BFF exposes `GET /api/site-write-permissions?organizationId=<UUID>`, `POST /api/sites?organizationId=<UUID>&portfolioId=<UUID>`, and `PATCH /api/sites/{siteId}?organizationId=<UUID>&portfolioId=<UUID>`; write protections match the portfolio BFF.
 
+## Building writes and audit trail
+
+The Registry exposes `POST /api/v1/buildings?organization_id=<UUID>` and `PATCH /api/v1/buildings/{building_id}?organization_id=<UUID>&portfolio_id=<UUID>&site_id=<UUID>`. Creation includes the portfolio and site IDs in its validated body. Both operations independently request `property-assets.buildings.create` or `property-assets.buildings.update` from Organization & Access; only active owners and admins may write. Creation verifies that the site belongs to the supplied portfolio and authorized organization. Updates verify the building's complete parent path and cannot move it to another site or organization. Only `name`, `building_code`, `address`, and `status` are editable; protected and unknown fields are rejected.
+
+Successful mutations and their `building_audit_events` rows share one database transaction. Audit rows record organization, building, operation, trusted actor ID, timestamp, and permitted changed-field names without field values, credentials, or tokens. Apply migration `0007_building_audit` before enabling these routes. The Next.js BFF exposes `GET /api/building-write-permissions?organizationId=<UUID>`, `POST /api/buildings?organizationId=<UUID>&portfolioId=<UUID>&siteId=<UUID>`, and `PATCH /api/buildings/{buildingId}?organizationId=<UUID>&portfolioId=<UUID>&siteId=<UUID>`. It reuses the server-side session, Origin/CSRF checks, Registry origin restriction, timeout, redirect protection, strict response parsing, and no-store behavior of the site write endpoints.
+
 ## Protected property hierarchy
 
 The following read-only endpoints use the same user authentication and `property-assets.portfolios.read` organization decision:

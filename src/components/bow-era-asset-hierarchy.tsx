@@ -11,6 +11,7 @@ import {
 import {
   buildingHref,
   fetchBuilding,
+  fetchBuildingWritePermissions,
   fetchBuildings,
   fetchSite,
   fetchSiteWritePermissions,
@@ -368,6 +369,57 @@ function SiteEditAction({
   );
 }
 
+function BuildingWriteAction({
+  action,
+  portfolioId,
+  siteId,
+  buildingId,
+  organizationId,
+}: {
+  action: 'create' | 'edit';
+  portfolioId: string;
+  siteId: string;
+  buildingId?: string;
+  organizationId: string;
+}) {
+  const [allowed, setAllowed] = useState(false);
+  const [verified, setVerified] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchBuildingWritePermissions(organizationId, controller.signal)
+      .then((permissions) => {
+        if (!controller.signal.aborted) {
+          setAllowed(
+            action === 'create'
+              ? permissions.can_create
+              : permissions.can_update,
+          );
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setVerified(true);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setVerified(true);
+      });
+    return () => controller.abort();
+  }, [action, organizationId]);
+
+  if (!verified || !allowed) return null;
+  const href =
+    action === 'create'
+      ? `/portfolio/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings/new?organizationId=${encodeURIComponent(organizationId)}`
+      : `/portfolio/${encodeURIComponent(portfolioId)}/sites/${encodeURIComponent(siteId)}/buildings/${encodeURIComponent(buildingId ?? '')}/edit?organizationId=${encodeURIComponent(organizationId)}`;
+  return (
+    <div className="bowera-editor-action-row">
+      <Link className="bow-era-button bow-era-button-secondary" href={href}>
+        {action === 'create' ? 'Add building' : 'Edit building'}
+      </Link>
+    </div>
+  );
+}
+
 function AssetDetails({ asset, level }: { asset: Asset; level: AssetLevel }) {
   const facts: Array<[string, string]> = [
     ['Status', asset.status === 'active' ? 'Active' : 'Inactive'],
@@ -565,6 +617,15 @@ export function AssetDetailPage({
                     siteId={siteId}
                   />
                 )}
+                {level === 'building' && organizationId && (
+                  <BuildingWriteAction
+                    action="edit"
+                    buildingId={buildingId}
+                    organizationId={organizationId}
+                    portfolioId={portfolioId}
+                    siteId={siteId}
+                  />
+                )}
               </div>
               <AssetDetails asset={data.asset} level={level} />
               {level === 'site' && organizationId && (
@@ -577,10 +638,18 @@ export function AssetDetailPage({
                       <p className="bow-era-eyebrow">Site contents</p>
                       <h2 id="building-list-title">Buildings</h2>
                     </div>
-                    <p className="bowera-portfolio-count">
-                      {data.children?.length ?? 0}{' '}
-                      {data.children?.length === 1 ? 'building' : 'buildings'}
-                    </p>
+                    <div className="bowera-editor-action-row">
+                      <p className="bowera-portfolio-count">
+                        {data.children?.length ?? 0}{' '}
+                        {data.children?.length === 1 ? 'building' : 'buildings'}
+                      </p>
+                      <BuildingWriteAction
+                        action="create"
+                        organizationId={organizationId}
+                        portfolioId={portfolioId}
+                        siteId={siteId}
+                      />
+                    </div>
                   </div>
                   <ChildCards
                     level="building"

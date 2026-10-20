@@ -71,6 +71,39 @@ class SiteUpdateRequest(BaseModel):
         return self
 
 
+class BuildingWriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    portfolio_id: UUID
+    site_id: UUID
+    name: str = Field(min_length=1, max_length=200)
+    building_code: str | None = Field(default=None, max_length=100)
+    address: str | None = Field(default=None, max_length=1000)
+    status: Literal["active", "inactive"] = "active"
+
+
+class BuildingUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    building_code: str | None = Field(default=None, max_length=100)
+    address: str | None = Field(default=None, max_length=1000)
+    status: Literal["active", "inactive"] | None = None
+
+    @field_validator("name", "status")
+    @classmethod
+    def reject_null_values(cls, value):
+        if value is None:
+            raise ValueError("Fields cannot be null.")
+        return value
+
+    @model_validator(mode="after")
+    def require_editable_fields(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one editable field is required.")
+        return self
+
+
 class PortfolioResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -88,6 +121,11 @@ class PortfolioWritePermissionsResponse(BaseModel):
 
 
 class SiteWritePermissionsResponse(BaseModel):
+    can_create: bool
+    can_update: bool
+
+
+class BuildingWritePermissionsResponse(BaseModel):
     can_create: bool
     can_update: bool
 

@@ -17,6 +17,7 @@ from sqlalchemy.sql.sqltypes import Uuid
 from app.database import Base
 from app.models import (
     Building,
+    BuildingAuditEvent,
     BuildingStatus,
     Portfolio,
     PortfolioAuditEvent,
@@ -34,6 +35,7 @@ def test_portfolio_table_and_uuid_primary_key_are_declared():
         "portfolios",
         "portfolio_audit_events",
         "site_audit_events",
+        "building_audit_events",
         "sites",
         "buildings",
         "units",
@@ -91,6 +93,21 @@ def test_site_audit_records_have_required_nonsecret_fields():
     } == set(columns.keys())
     assert all(not columns[name].nullable for name in columns.keys())
     assert "site_audit_events" in Base.metadata.tables
+
+
+def test_building_audit_records_have_required_nonsecret_fields():
+    columns = BuildingAuditEvent.__table__.c
+    assert {
+        "id",
+        "organization_id",
+        "building_id",
+        "operation",
+        "actor_id",
+        "occurred_at",
+        "changed_fields",
+    } == set(columns.keys())
+    assert all(not columns[name].nullable for name in columns.keys())
+    assert "building_audit_events" in Base.metadata.tables
 
 
 def test_portfolio_organization_id_is_indexed_without_cross_service_foreign_key():
