@@ -32,7 +32,7 @@ Other proposed read-only endpoints, to be added only with authentication and aut
 - `GET /api/v1/users/me` — require authentication and may return only the caller's own user profile.
 - `GET /api/v1/organizations/{organization_id}/memberships` — require authentication plus authorization to view membership data for that organization.
 
-There are no create, update, or delete endpoints. No unauthenticated caller may retrieve organization, user, or membership records. Authentication, membership checks, and any role-based policy must be implemented and reviewed before additional routes are exposed.
+There are no organization, user, or membership create, update, or delete endpoints. No unauthenticated caller may retrieve organization, user, or membership records.
 
 ## Cognito access-token verification foundation
 
@@ -48,13 +48,17 @@ The expected deployment boundary is a Next.js BFF using Authorization Code with 
 
 Successful authorization returns only an `AuthorizedMembership` context. Missing users or memberships, suspended records, and role mismatches return the same `403` response. Database lookup/configuration failures return a sanitized `503` and never grant access. Authentication proves the Cognito identity; membership authorization separately limits that identity to an active, explicitly requested organization. These helpers do not manage memberships.
 
-## Internal portfolio-read authorization decision
+## Internal portfolio authorization decisions
 
-`POST /internal/v1/authorization/decisions` is an internal service endpoint. It accepts only an `organization_id` UUID and the operation `property-assets.portfolios.read`. The caller must present both a user Cognito access token in `Authorization: Bearer ...` and a separate workload Cognito access token in `X-Service-Authorization: Bearer ...`.
+The supported operations are `property-assets.portfolios.read`, `property-assets.portfolios.create`, and `property-assets.portfolios.update`. Active members may read portfolios; create and update are restricted to active `owner` and `admin` memberships. Successful decisions also include the authenticated actor's internal user UUID as `actor_id`, used by the Registry audit trail.
+
+The decision endpoint accepts an `organization_id` UUID and one of the three supported portfolio operations listed above. The caller must present both a user Cognito access token and a separate workload Cognito access token.
+
+`POST /internal/v1/authorization/decisions` is an internal service endpoint. It accepts an `organization_id` UUID and one of the three supported portfolio operations listed above. The caller must present both a user Cognito access token in `Authorization: Bearer ...` and a separate workload Cognito access token in `X-Service-Authorization: Bearer ...`.
 
 The user token is verified with the existing user-pool issuer, `COGNITO_APP_CLIENT_ID`, and `COGNITO_REQUIRED_SCOPE`; its verified `sub` is the only user identity used for membership lookup. The workload token is independently verified against the same configured Cognito issuer/JWKS, but must have the distinct `COGNITO_WORKLOAD_CLIENT_ID`, `COGNITO_WORKLOAD_REQUIRED_SCOPE`, and `token_use=access`. User and workload client IDs must differ. Do not forward the user token as the workload credential or trust caller-supplied user IDs or roles.
 
-An active user membership in an active organization receives a minimal decision containing only the organization ID, operation, and `allowed: true`. Missing or invalid credentials return a generic `401`, inactive or absent membership returns a generic `403`, invalid request fields or unsupported operations return `422`, and missing verifier configuration or database failures fail closed with a sanitized `503`. No membership records or personal information are returned. The service caller must be restricted to a trusted network/service boundary; this endpoint does not itself provision workload credentials.
+An active member in an active organization is allowed to read portfolios. Portfolio create and update decisions are limited to active `owner` and `admin` memberships; `member` is denied. A successful decision contains only the organization ID, operation, `allowed: true`, and the authenticated actor's internal user UUID (`actor_id`) for the Registry audit record. Missing or invalid credentials return a generic `401`, inactive or absent membership and role denials return a generic `403`, invalid request fields or unsupported operations return `422`, and missing verifier configuration or database failures fail closed with a sanitized `503`. No membership records or unnecessary personal information are returned. The service caller must be restricted to a trusted network/service boundary; this endpoint does not itself provision workload credentials.
 
 ## Database migrations
 

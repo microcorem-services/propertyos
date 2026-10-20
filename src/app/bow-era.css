@@ -879,6 +879,164 @@
   line-height: 1.5;
 }
 
+.bowera-portfolio-heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 20px;
+}
+
+.bowera-editor-content {
+  max-width: 780px;
+  margin-top: 38px;
+}
+
+.bowera-editor-panel {
+  display: grid;
+  gap: 18px;
+  padding: clamp(24px, 4vw, 42px);
+  border: 1px solid #e6eae7;
+  border-radius: 3px;
+  background: #ffffff;
+  box-shadow: 0 12px 38px rgb(16 61 50 / 5%);
+}
+
+.bowera-editor-panel .bow-era-eyebrow {
+  margin: 0;
+}
+
+.bowera-editor-title {
+  margin: -7px 0 0;
+  color: var(--bow-era-green);
+  font-family: var(--font-plus-jakarta), sans-serif;
+  font-size: clamp(24px, 3vw, 32px);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+
+.bowera-editor-copy {
+  margin: -8px 0 5px;
+  color: var(--bow-era-muted);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.bowera-editor-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(170px, 0.7fr);
+  gap: 20px;
+  margin-top: 7px;
+}
+
+.bowera-editor-field {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.bowera-editor-field label {
+  color: var(--bow-era-green);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.bowera-editor-field input,
+.bowera-editor-field select {
+  width: 100%;
+  min-height: 48px;
+  padding: 11px 13px;
+  border: 1px solid #cfd8d2;
+  border-radius: 2px;
+  background: #ffffff;
+  color: var(--bow-era-charcoal);
+  font: inherit;
+  font-size: 15px;
+}
+
+.bowera-editor-field input:focus-visible,
+.bowera-editor-field select:focus-visible {
+  outline: 3px solid var(--bow-era-focus);
+  outline-offset: 2px;
+  border-color: var(--bow-era-green);
+}
+
+.bowera-editor-hint {
+  color: var(--bow-era-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bowera-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 7px;
+}
+
+.bowera-editor-actions .bow-era-button,
+.bowera-editor-panel > .bow-era-button {
+  width: fit-content;
+  text-decoration: none;
+}
+
+.bowera-editor-actions button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.bowera-editor-error {
+  margin: 0;
+  padding: 13px 15px;
+  border-left: 3px solid #a74d42;
+  background: #fbf5f3;
+  color: #71362e;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.bowera-editor-error p {
+  margin: 0;
+}
+
+.bowera-editor-error p + p,
+.bowera-editor-error p + a {
+  display: inline-block;
+  margin-top: 6px;
+}
+
+.bowera-editor-action-row {
+  display: flex;
+  justify-content: flex-end;
+  margin: 20px 0 34px;
+}
+
+.bowera-editor-permission-note {
+  margin: 18px 0 34px;
+  color: var(--bow-era-muted);
+  font-size: 13px;
+}
+
+.bowera-inline-retry {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--bow-era-green);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.bowera-inline-retry:focus-visible {
+  outline: 3px solid var(--bow-era-focus);
+  outline-offset: 3px;
+}
+
 @media (max-width: 900px) {
   .bowera-portfolio-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -896,6 +1054,37 @@
 
   .bowera-portfolio-page .bow-era-title {
     font-size: clamp(38px, 5vw, 48px);
+  }
+
+  .bowera-portfolio-heading-actions {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .bowera-editor-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .bowera-editor-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .bowera-editor-actions .bow-era-button,
+  .bowera-editor-panel > .bow-era-button {
+    width: 100%;
+  }
+
+  .bowera-editor-action-row {
+    justify-content: stretch;
+  }
+
+  .bowera-editor-action-row .bow-era-button {
+    width: 100%;
+    justify-content: center;
   }
 }
 

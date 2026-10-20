@@ -10,11 +10,13 @@ import {
   Wordmark,
 } from '@/components/bow-era-ui';
 import {
+  fetchPortfolioWritePermissions,
   fetchPortfolios,
   parsePortfolioOrganizationId,
   portfolioDetailHref,
   PortfoliosRequestError,
   type Portfolio,
+  type PortfolioWritePermissions,
 } from '@/lib/portfolios/client';
 
 function signInHref(organizationId: string): string {
@@ -72,6 +74,9 @@ function PortfolioCard({ portfolio }: { portfolio: Portfolio }) {
 export default function PortfolioPage() {
   const [organizationId, setOrganizationId] = useState<string | null>(null);
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
+  const [writePermissions, setWritePermissions] =
+    useState<PortfolioWritePermissions | null>(null);
+  const [permissionError, setPermissionError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<PortfoliosRequestError | null>(null);
 
@@ -79,10 +84,23 @@ export default function PortfolioPage() {
     async (id: string, signal?: AbortSignal) => {
       setLoading(true);
       setError(null);
+      setPermissionError(false);
+      setWritePermissions(null);
       try {
-        const results = await fetchPortfolios(id, signal);
+        const [portfolioResult, permissionResult] = await Promise.allSettled([
+          fetchPortfolios(id, signal),
+          fetchPortfolioWritePermissions(id, signal),
+        ]);
         if (signal?.aborted) return;
-        setPortfolios(results);
+        if (portfolioResult.status === 'rejected') {
+          throw portfolioResult.reason;
+        }
+        setPortfolios(portfolioResult.value);
+        if (permissionResult.status === 'fulfilled') {
+          setWritePermissions(permissionResult.value);
+        } else {
+          setPermissionError(true);
+        }
       } catch (requestError) {
         if (signal?.aborted) return;
         setError(
@@ -152,12 +170,36 @@ export default function PortfolioPage() {
               <h2 id="portfolio-list-heading">Your portfolios</h2>
             </div>
             {!loading && !error && (
-              <p className="bowera-portfolio-count" aria-live="polite">
-                {portfolios.length}{' '}
-                {portfolios.length === 1 ? 'portfolio' : 'portfolios'}
-              </p>
+              <div className="bowera-portfolio-heading-actions">
+                <p className="bowera-portfolio-count" aria-live="polite">
+                  {portfolios.length}{' '}
+                  {portfolios.length === 1 ? 'portfolio' : 'portfolios'}
+                </p>
+                {writePermissions?.can_create && organizationId && (
+                  <Link
+                    className="bow-era-button"
+                    href={`/portfolio/new?organizationId=${encodeURIComponent(organizationId)}`}
+                  >
+                    New portfolio
+                  </Link>
+                )}
+              </div>
             )}
           </div>
+
+          {!loading && !error && permissionError && (
+            <p className="bowera-editor-error" role="status">
+              Portfolio editing permissions could not be verified, so write
+              actions are unavailable.
+              <button
+                className="bowera-inline-retry"
+                onClick={() => organizationId && void loadPortfolios(organizationId)}
+                type="button"
+              >
+                Try again
+              </button>
+            </p>
+          )}
 
           {!organizationId ? (
             <ErrorMessage

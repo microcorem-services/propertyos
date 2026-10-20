@@ -16,6 +16,7 @@ from app.workload_token import WorkloadTokenError
 
 
 ORGANIZATION_ID = uuid4()
+ACTOR_ID = uuid4()
 USER_TOKEN = "fictional.header.signature"
 WORKLOAD_TOKEN = "fictional.workload.signature"
 SERVICE_URL = "https://organization-access.example.test"
@@ -28,6 +29,7 @@ def valid_decision(*, organization_id=ORGANIZATION_ID, **changes):
         "organization_id": str(organization_id),
         "operation": PORTFOLIO_READ_OPERATION,
         "allowed": True,
+        "actor_id": str(ACTOR_ID),
     }
     payload.update(changes)
     return httpx.Response(200, json=payload)
@@ -403,6 +405,7 @@ def test_timeout_and_transport_failure_map_to_sanitized_503(
             "organization_id": str(uuid4()),
             "operation": PORTFOLIO_READ_OPERATION,
             "allowed": True,
+            "actor_id": str(ACTOR_ID),
         },
         {
             "organization_id": str(ORGANIZATION_ID),

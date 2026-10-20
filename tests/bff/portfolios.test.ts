@@ -96,6 +96,7 @@ function setup(options: {
       if (options.configurationError) throw options.configurationError;
       return { baseUrl: registryUrl, timeoutMs: 2_500 };
     },
+    appOrigin: () => new URL('https://app.example'),
     sessions: () => ({
       retrieve: async (id) => {
         retrieved.push(id);
@@ -117,10 +118,11 @@ function setup(options: {
   const request = (
     url = `https://app.example/api/portfolios?organizationId=${organizationId}`,
     headers: HeadersInit = {},
+    init: RequestInit = {},
   ) => {
     const requestHeaders = new Headers(headers);
     requestHeaders.set('Cookie', cookie);
-    return new Request(url, { headers: requestHeaders });
+    return new Request(url, { ...init, headers: requestHeaders });
   };
 
   return {
@@ -587,4 +589,221 @@ test('rejects cross-parent and malformed hierarchy responses and sanitizes error
   );
   assert.equal(response.status, 401);
   assert.equal(expired.calls(), 0);
+});
+
+test('creates a portfolio through the fixed Registry destination with same-origin CSRF checks', async () => {
+  const created = {
+    ...portfolio,
+    name: 'New estate',
+  };
+  const context = setup({ response: makeResponse(201, created) });
+  const response = await context.handlers.createPortfolio(
+    context.request(
+      `https://app.example/api/portfolios?organizationId=${organizationId}`,
+      {
+        Origin: 'https://app.example',
+        'Content-Type': 'application/json',
+      },
+      { method: 'POST', body: JSON.stringify({ name: '  New estate  ' }) },
+    ),
+  );
+
+  assert.equal(response.status, 201);
+  assert.deepEqual(await response.json(), created);
+  assert.equal(
+    context.requestedUrl()?.href,
+    `https://property-assets.example.test/api/v1/portfolios?organization_id=${organizationId}`,
+  );
+  assert.equal(context.requestInit()?.method, 'POST');
+  assert.equal(context.requestInit()?.redirect, 'manual');
+  assert.equal(context.requestInit()?.cache, 'no-store');
+  assert.deepEqual(JSON.parse(String(context.requestInit()?.body)), {
+    name: 'New estate',
+  });
+  assert.equal(
+    new Headers(context.requestInit()?.headers).get('Authorization'),
+    'Bearer ' + accessToken,
+  );
+});
+
+test('updates only validated portfolio fields and verifies returned identity', async () => {
+  const updated = { ...portfolio, name: 'Renamed estate' };
+  const context = setup({ response: makeResponse(200, updated) });
+  const response = await context.handlers.updatePortfolio(
+    context.request(
+      `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+      {
+        Origin: 'https://app.example',
+        'Content-Type': 'application/json',
+      },
+      { method: 'PATCH', body: JSON.stringify({ name: 'Renamed estate' }) },
+    ),
+    portfolioId,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), updated);
+  assert.equal(context.requestInit()?.method, 'PATCH');
+  assert.equal(context.requestInit()?.redirect, 'manual');
+  assert.equal(context.requestInit()?.cache, 'no-store');
+});
+
+test('write requests reject cross-origin, absent-Origin, and unexpected body fields', async () => {
+  for (const [headers, body] of [
+    [
+      { Origin: 'https://attacker.example', 'Content-Type': 'application/json' },
+      { name: 'Estate' },
+    ],
+    [
+      { 'Content-Type': 'application/json' },
+      { name: 'Estate' },
+    ],
+    [
+      { Origin: 'https://app.example', 'Content-Type': 'application/json' },
+      { name: 'Estate', organization_id: organizationId },
+    ],
+    [
+      { Origin: 'https://app.example', 'Content-Type': 'application/json' },
+      { name: '   ' },
+    ],
+  ] as Array<[HeadersInit, Record<string, unknown>]>) {
+    const context = setup();
+    const expectedStatus =
+      new Headers(headers).get('origin') === 'https://app.example' ? 400 : 403;
+    const response = await context.handlers.createPortfolio(
+      context.request(
+        `https://app.example/api/portfolios?organizationId=${organizationId}`,
+        headers,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    );
+    assert.equal(response.status, expectedStatus);
+    assert.equal(context.calls(), 0);
+    assert.equal(context.retrieved.length, 0);
+  }
+});
+
+test('write endpoints fail closed for invalid IDs, duplicate selectors and expired sessions', async () => {
+  const invalidId = setup();
+  const invalid = await invalidId.handlers.updatePortfolio(
+    invalidId.request(
+      `https://app.example/api/portfolios/not-a-uuid?organizationId=${organizationId}`,
+      {
+        Origin: 'https://app.example',
+        'Content-Type': 'application/json',
+      },
+      { method: 'PATCH', body: JSON.stringify({ name: 'Rename' }) },
+    ),
+    'not-a-uuid',
+  );
+  assert.equal(invalid.status, 400);
+  assert.equal(invalidId.retrieved.length, 0);
+
+  const duplicateSelector = setup();
+  const duplicate = await duplicateSelector.handlers.createPortfolio(
+    duplicateSelector.request(
+      `https://app.example/api/portfolios?organizationId=${organizationId}&organizationId=${organizationId}`,
+      {
+        Origin: 'https://app.example',
+        'Content-Type': 'application/json',
+      },
+      { method: 'POST', body: JSON.stringify({ name: 'Estate' }) },
+    ),
+  );
+  assert.equal(duplicate.status, 400);
+  assert.equal(duplicateSelector.retrieved.length, 0);
+
+  const expired = setup({
+    session: {
+      data: {
+        accessToken,
+        accessTokenExpiresAt: String(now),
+      },
+    },
+  });
+  const response = await expired.handlers.createPortfolio(
+    expired.request(
+      `https://app.example/api/portfolios?organizationId=${organizationId}`,
+      {
+        Origin: 'https://app.example',
+        'Content-Type': 'application/json',
+      },
+      { method: 'POST', body: JSON.stringify({ name: 'Estate' }) },
+    ),
+  );
+  assert.equal(response.status, 401);
+  assert.equal(expired.calls(), 0);
+});
+
+test('write responses sanitize authorization failures, redirects, service errors, and malformed payloads', async () => {
+  for (const [status, expected] of [
+    [401, 401],
+    [403, 403],
+    [404, 404],
+    [302, 503],
+    [500, 503],
+  ]) {
+    const context = setup({
+      response: makeResponse(status, { error: 'fictional secret and token' }),
+    });
+    const response = await context.handlers.updatePortfolio(
+      context.request(
+        `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+        {
+          Origin: 'https://app.example',
+          'Content-Type': 'application/json',
+        },
+        { method: 'PATCH', body: JSON.stringify({ name: 'Rename' }) },
+      ),
+      portfolioId,
+    );
+    assert.equal(response.status, expected);
+    assert.doesNotMatch(await response.text(), /fictional secret|token/);
+  }
+
+  const malformed = setup({
+    response: makeResponse(200, { ...portfolio, organization_id: 'wrong' }),
+  });
+  const response = await malformed.handlers.updatePortfolio(
+    malformed.request(
+      `https://app.example/api/portfolios/${portfolioId}?organizationId=${organizationId}`,
+      {
+        Origin: 'https://app.example',
+        'Content-Type': 'application/json',
+      },
+      { method: 'PATCH', body: JSON.stringify({ status: 'inactive' }) },
+    ),
+    portfolioId,
+  );
+  assert.equal(response.status, 502);
+  assert.doesNotMatch(await response.text(), /fictional/);
+});
+
+test('write permissions are allowlisted and never cached', async () => {
+  const permissions = { can_create: false, can_update: true };
+  const context = setup({ response: makeResponse(200, permissions) });
+  const response = await context.handlers.getPortfolioWritePermissions(
+    context.request(
+      `https://app.example/api/portfolio-write-permissions?organizationId=${organizationId}`,
+    ),
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), permissions);
+  assert.equal(
+    context.requestedUrl()?.href,
+    `https://property-assets.example.test/api/v1/portfolio-write-permissions?organization_id=${organizationId}`,
+  );
+  assert.equal(context.requestInit()?.redirect, 'manual');
+  assert.equal(context.requestInit()?.cache, 'no-store');
+
+  const malformed = setup({
+    response: makeResponse(200, { ...permissions, role: 'admin' }),
+  });
+  const invalid = await malformed.handlers.getPortfolioWritePermissions(
+    malformed.request(
+      `https://app.example/api/portfolio-write-permissions?organizationId=${organizationId}`,
+    ),
+  );
+  assert.equal(invalid.status, 502);
 });

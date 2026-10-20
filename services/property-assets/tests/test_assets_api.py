@@ -14,6 +14,7 @@ from app.main import app, get_portfolio_session
 from app.models import Building, Site, Unit
 
 ORGANIZATION_ID = uuid4()
+ACTOR_ID = uuid4()
 PORTFOLIO_ID = uuid4()
 SITE_ID = uuid4()
 BUILDING_ID = uuid4()
@@ -31,6 +32,7 @@ def valid_decision():
             "organization_id": str(ORGANIZATION_ID),
             "operation": PORTFOLIO_READ_OPERATION,
             "allowed": True,
+            "actor_id": str(ACTOR_ID),
         },
     )
 

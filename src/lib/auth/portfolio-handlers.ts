@@ -1,5 +1,6 @@
 import 'server-only';
 
+import { loadAppOrigin } from './cognito';
 import { readSessionCookie } from './session';
 
 const PORTFOLIOS_PATH = '/api/v1/portfolios';
@@ -14,6 +15,7 @@ const TIMESTAMP_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/;
 const PORTFOLIO_STATUSES = new Set(['active', 'inactive']);
 const MAX_ASSETS = 1_000;
+const MAX_WRITE_BODY_BYTES = 8 * 1024;
 
 export type Portfolio = {
   id: string;
@@ -22,6 +24,11 @@ export type Portfolio = {
   status: 'active' | 'inactive';
   created_at: string;
   updated_at: string;
+};
+
+export type PortfolioWritePermissions = {
+  can_create: boolean;
+  can_update: boolean;
 };
 
 export type Site = {
@@ -84,6 +91,7 @@ type PropertyAssetRegistryConfiguration = {
 
 type PortfolioHandlerDependencies = {
   configuration?: () => PropertyAssetRegistryConfiguration;
+  appOrigin?: () => URL;
   sessions: () => PortfolioSessionManager;
   fetch?: typeof fetch;
   now?: () => number;
@@ -424,6 +432,95 @@ function parsePortfolios(payload: unknown, organizationId: string): Portfolio[] 
   return portfolios;
 }
 
+function parseEditablePortfolioPayload(
+  value: unknown,
+  patch: boolean,
+): { name?: string; status?: 'active' | 'inactive' } | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const payload = value as Record<string, unknown>;
+  const keys = Object.keys(payload);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => key !== 'name' && key !== 'status') ||
+    (!patch && !Object.hasOwn(payload, 'name')) ||
+    (patch && keys.length === 0)
+  ) {
+    return null;
+  }
+  const parsed: { name?: string; status?: 'active' | 'inactive' } = {};
+  if (Object.hasOwn(payload, 'name')) {
+    if (
+      typeof payload.name !== 'string' ||
+      payload.name.trim().length === 0 ||
+      payload.name.trim().length > 200
+    ) {
+      return null;
+    }
+    parsed.name = payload.name.trim();
+  }
+  if (Object.hasOwn(payload, 'status')) {
+    if (payload.status !== 'active' && payload.status !== 'inactive') {
+      return null;
+    }
+    parsed.status = payload.status;
+  }
+  return parsed;
+}
+
+async function readWriteRequestBody(request: Request): Promise<unknown> {
+  const contentType = request.headers.get('content-type')?.toLowerCase();
+  if (!contentType || !/^application\/json(?:\s*;|$)/.test(contentType)) {
+    throw new TypeError('Invalid portfolio request.');
+  }
+  const contentLength = request.headers.get('content-length');
+  if (contentLength !== null) {
+    const length = Number(contentLength);
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > MAX_WRITE_BODY_BYTES
+    ) {
+      throw new TypeError('Invalid portfolio request.');
+    }
+  }
+  if (!request.body) throw new TypeError('Invalid portfolio request.');
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_WRITE_BODY_BYTES) {
+        await reader.cancel();
+        throw new TypeError('Invalid portfolio request.');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+}
+
+function isSameOriginWriteRequest(request: Request, appOrigin: URL): boolean {
+  const origin = request.headers.get('origin');
+  const fetchSite = request.headers.get('sec-fetch-site');
+  return (
+    origin === appOrigin.origin &&
+    (fetchSite === null || fetchSite === 'same-origin')
+  );
+}
+
 async function readPortfolioPayload(response: Response): Promise<unknown> {
   const contentLength = response.headers.get('content-length');
   if (contentLength !== null) {
@@ -569,7 +666,195 @@ export function createPortfolioHandlers(
     }
   }
 
+  async function getWritePermissions(request: Request): Promise<Response> {
+    const organizationId = requestedOrganizationId(new URL(request.url));
+    if (!organizationId) {
+      return errorResponse(400, 'Invalid portfolio permissions request.');
+    }
+    try {
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const upstreamUrl = new URL(
+        '/api/v1/portfolio-write-permissions',
+        config.baseUrl,
+      );
+      upstreamUrl.searchParams.set('organization_id', organizationId);
+      const upstream = await fetcher(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Organization access denied.');
+      }
+      if (upstream.status !== 200 || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (
+        !upstream.headers
+          .get('content-type')
+          ?.toLowerCase()
+          .includes('application/json')
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      let payload: unknown;
+      try {
+        payload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      if (
+        payload === null ||
+        typeof payload !== 'object' ||
+        Array.isArray(payload) ||
+        Object.keys(payload).length !== 2 ||
+        typeof (payload as Record<string, unknown>).can_create !== 'boolean' ||
+        typeof (payload as Record<string, unknown>).can_update !== 'boolean'
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(
+        {
+          can_create: (payload as Record<string, boolean>).can_create,
+          can_update: (payload as Record<string, boolean>).can_update,
+        },
+        { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } },
+      );
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
+  async function writePortfolio(
+    request: Request,
+    method: 'POST' | 'PATCH',
+    portfolioId?: string,
+  ): Promise<Response> {
+    const organizationId = requestedOrganizationId(new URL(request.url));
+    if (
+      !organizationId ||
+      (method === 'POST' && portfolioId !== undefined) ||
+      (method === 'PATCH' && portfolioId === undefined) ||
+      (portfolioId !== undefined && !UUID_PATTERN.test(portfolioId))
+    ) {
+      return errorResponse(400, 'Invalid portfolio request.');
+    }
+
+    try {
+      const appOrigin = (dependencies.appOrigin ?? loadAppOrigin)();
+      if (!isSameOriginWriteRequest(request, appOrigin)) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      let rawPayload: unknown;
+      try {
+        rawPayload = await readWriteRequestBody(request);
+      } catch {
+        return errorResponse(400, 'Invalid portfolio request.');
+      }
+      const payload = parseEditablePortfolioPayload(
+        rawPayload,
+        method === 'PATCH',
+      );
+      if (!payload) return errorResponse(400, 'Invalid portfolio request.');
+
+      const accessToken = await readAccessToken(
+        request,
+        dependencies.sessions,
+        now,
+      );
+      if (!accessToken) return errorResponse(401, 'Authentication required.');
+
+      const config = configuration();
+      const path =
+        portfolioId === undefined
+          ? PORTFOLIOS_PATH
+          : `${PORTFOLIOS_PATH}/${encodeURIComponent(portfolioId)}`;
+      const upstreamUrl = new URL(path, config.baseUrl);
+      upstreamUrl.searchParams.set('organization_id', organizationId);
+      const upstream = await fetcher(upstreamUrl, {
+        method,
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        body: JSON.stringify(payload),
+        cache: 'no-store',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(config.timeoutMs),
+      });
+      if (upstream.status === 401) {
+        return errorResponse(401, 'Authentication required.');
+      }
+      if (upstream.status === 403) {
+        return errorResponse(403, 'Portfolio write access denied.');
+      }
+      if (upstream.status === 404) {
+        return errorResponse(404, 'Portfolio not found.');
+      }
+      if (upstream.status === 422) {
+        return errorResponse(400, 'Invalid portfolio request.');
+      }
+      const expectedStatus = method === 'POST' ? 201 : 200;
+      if (upstream.status !== expectedStatus || upstream.redirected) {
+        return errorResponse(503, 'Property service unavailable.');
+      }
+      if (
+        !upstream.headers
+          .get('content-type')
+          ?.toLowerCase()
+          .includes('application/json')
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      let responsePayload: unknown;
+      try {
+        responsePayload = await readPortfolioPayload(upstream);
+      } catch {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      const portfolios = parsePortfolios([responsePayload], organizationId);
+      if (
+        !portfolios ||
+        (portfolioId !== undefined &&
+          portfolios[0].id.toLowerCase() !== portfolioId.toLowerCase())
+      ) {
+        return errorResponse(502, 'Invalid Property & Asset Registry response.');
+      }
+      return Response.json(portfolios[0], {
+        status: expectedStatus,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(503, 'Property service unavailable.');
+    }
+  }
+
   return {
+    getPortfolioWritePermissions(request: Request): Promise<Response> {
+      return getWritePermissions(request);
+    },
+    createPortfolio(request: Request): Promise<Response> {
+      return writePortfolio(request, 'POST');
+    },
+    updatePortfolio(request: Request, portfolioId: string): Promise<Response> {
+      return writePortfolio(request, 'PATCH', portfolioId);
+    },
     async getPortfolios(request: Request): Promise<Response> {
       const organizationId = requestedOrganizationId(new URL(request.url));
       if (!organizationId) {

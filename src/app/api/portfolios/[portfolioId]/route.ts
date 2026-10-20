@@ -13,3 +13,13 @@ export async function GET(
     sessions: () => getAuthSessionManagers().authenticated,
   }).getPortfolio(request, portfolioId);
 }
+
+export async function PATCH(
+  request: Request,
+  context: { params: Promise<{ portfolioId: string }> },
+): Promise<Response> {
+  const { portfolioId } = await context.params;
+  return createPortfolioHandlers({
+    sessions: () => getAuthSessionManagers().authenticated,
+  }).updatePortfolio(request, portfolioId);
+}

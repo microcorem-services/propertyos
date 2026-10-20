@@ -1,7 +1,9 @@
 from collections.abc import Generator
+from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import and_, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -11,15 +13,24 @@ from app import database
 from app.authorization import (
     AuthorizationDependencyUnavailable,
     AuthorizedOrganization,
+    CREATE_OPERATION,
     OrganizationAccessDenied,
+    UPDATE_OPERATION,
     UserAuthenticationRequired,
+    get_authorization_workload_token,
     get_authorized_organization,
+    get_portfolio_write_permissions,
+    get_user_bearer_token,
+    portfolio_write_authorization,
 )
 from app.config import SERVICE_NAME
-from app.models import Building, Portfolio, Site, Unit
+from app.models import Building, Portfolio, PortfolioAuditEvent, Site, Unit
 from app.schemas import (
     BuildingResponse,
     PortfolioResponse,
+    PortfolioUpdateRequest,
+    PortfolioWritePermissionsResponse,
+    PortfolioWriteRequest,
     SiteResponse,
     UnitResponse,
 )
@@ -31,6 +42,10 @@ app.include_router(api_router)
 
 class PropertyDatabaseUnavailable(Exception):
     pass
+
+
+_create_portfolio_authorization = portfolio_write_authorization(CREATE_OPERATION)
+_update_portfolio_authorization = portfolio_write_authorization(UPDATE_OPERATION)
 
 
 def get_portfolio_session() -> Generator[Session, None, None]:
@@ -104,6 +119,16 @@ async def database_not_configured_handler(
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, error: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Invalid request."},
+    )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": SERVICE_NAME}
@@ -152,6 +177,105 @@ def get_portfolio(
 
     if portfolio is None:
         raise HTTPException(status_code=404, detail="Portfolio not found")
+    return portfolio
+
+
+@api_router.get(
+    "/portfolio-write-permissions",
+    response_model=PortfolioWritePermissionsResponse,
+)
+def portfolio_write_permissions(
+    organization_id: UUID = Query(...),
+    user_token: str = Depends(get_user_bearer_token),
+    workload_token: str = Depends(get_authorization_workload_token),
+):
+    return get_portfolio_write_permissions(
+        organization_id,
+        user_token,
+        workload_token,
+    )
+
+
+@api_router.post(
+    "/portfolios",
+    response_model=PortfolioResponse,
+    status_code=201,
+)
+def create_portfolio(
+    payload: PortfolioWriteRequest,
+    _authorization: AuthorizedOrganization = Depends(
+        _create_portfolio_authorization
+    ),
+    session: Session = Depends(get_portfolio_session),
+) -> Portfolio:
+    try:
+        with session.begin():
+            portfolio = Portfolio(
+                organization_id=_authorization.organization_id,
+                name=payload.name,
+                status=payload.status,
+            )
+            session.add(portfolio)
+            session.flush()
+            session.add(
+                PortfolioAuditEvent(
+                    organization_id=_authorization.organization_id,
+                    portfolio_id=portfolio.id,
+                    operation=CREATE_OPERATION,
+                    actor_id=_authorization.actor_id,
+                    changed_fields=["name", "status"],
+                )
+            )
+            session.flush()
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
+    return portfolio
+
+
+@api_router.patch(
+    "/portfolios/{portfolio_id}",
+    response_model=PortfolioResponse,
+)
+def update_portfolio(
+    portfolio_id: UUID,
+    payload: PortfolioUpdateRequest,
+    _authorization: AuthorizedOrganization = Depends(
+        _update_portfolio_authorization
+    ),
+    session: Session = Depends(get_portfolio_session),
+) -> Portfolio:
+    updates = payload.model_dump(exclude_unset=True)
+    try:
+        with session.begin():
+            portfolio = session.scalar(
+                select(Portfolio).where(
+                    Portfolio.id == portfolio_id,
+                    Portfolio.organization_id == _authorization.organization_id,
+                )
+            )
+            if portfolio is None:
+                raise HTTPException(status_code=404, detail="Portfolio not found")
+
+            changed_fields = sorted(
+                field
+                for field, value in updates.items()
+                if value != getattr(portfolio, field)
+            )
+            for field, value in updates.items():
+                setattr(portfolio, field, value)
+            portfolio.updated_at = datetime.now(UTC)
+            session.add(
+                PortfolioAuditEvent(
+                    organization_id=_authorization.organization_id,
+                    portfolio_id=portfolio.id,
+                    operation=UPDATE_OPERATION,
+                    actor_id=_authorization.actor_id,
+                    changed_fields=changed_fields,
+                )
+            )
+            session.flush()
+    except SQLAlchemyError:
+        raise PropertyDatabaseUnavailable from None
     return portfolio
 
 

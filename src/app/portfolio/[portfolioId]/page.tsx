@@ -10,6 +10,7 @@ import {
   PageHeading,
   Wordmark,
 } from '@/components/bow-era-ui';
+import { PortfolioEditAction } from '@/components/bow-era-portfolio-editor';
 import {
   fetchPortfolio,
   parsePortfolioOrganizationId,
@@ -262,10 +263,16 @@ export default function PortfolioDetailPage() {
           <>
             <PortfolioDetails portfolio={portfolio} />
             {organizationId && (
-              <SiteCollection
-                portfolioId={portfolioId}
-                organizationId={organizationId}
-              />
+              <>
+                <PortfolioEditAction
+                  organizationId={organizationId}
+                  portfolioId={portfolioId}
+                />
+                <SiteCollection
+                  portfolioId={portfolioId}
+                  organizationId={organizationId}
+                />
+              </>
             )}
           </>
         ) : null}

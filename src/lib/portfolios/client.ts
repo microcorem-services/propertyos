@@ -43,6 +43,16 @@ export type Unit = {
   updated_at: string;
 };
 
+export type PortfolioWritePermissions = {
+  can_create: boolean;
+  can_update: boolean;
+};
+
+export type PortfolioEditableFields = {
+  name: string;
+  status: 'active' | 'inactive';
+};
+
 export class PortfoliosRequestError extends Error {
   constructor(
     message: string,
@@ -546,6 +556,169 @@ export async function fetchPortfolio(
       502,
     );
   }
+}
+
+export async function fetchPortfolioWritePermissions(
+  organizationId: string,
+  signal?: AbortSignal,
+): Promise<PortfolioWritePermissions> {
+  if (!UUID_PATTERN.test(organizationId)) {
+    throw new PortfoliosRequestError('Choose a valid organisation first.', 400);
+  }
+  let response: Response;
+  try {
+    const query = new URLSearchParams({ organizationId });
+    response = await fetch(`/api/portfolio-write-permissions?${query}`, {
+      method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: { Accept: 'application/json' },
+      signal,
+    });
+  } catch {
+    throw new PortfoliosRequestError(
+      'Portfolio permissions could not be reached. Please try again.',
+      0,
+    );
+  }
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have access to this organisation.',
+      403,
+    );
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      'Portfolio permissions could not be verified.',
+      response.status,
+    );
+  }
+  try {
+    const payload: unknown = await response.json();
+    if (
+      !isRecord(payload) ||
+      Object.keys(payload).length !== 2 ||
+      typeof payload.can_create !== 'boolean' ||
+      typeof payload.can_update !== 'boolean'
+    ) {
+      throw new TypeError();
+    }
+    return {
+      can_create: payload.can_create,
+      can_update: payload.can_update,
+    };
+  } catch {
+    throw new PortfoliosRequestError(
+      'Portfolio permissions could not be verified.',
+      502,
+    );
+  }
+}
+
+async function writePortfolio(
+  method: 'POST' | 'PATCH',
+  organizationId: string,
+  fields: Partial<PortfolioEditableFields>,
+  portfolioId?: string,
+): Promise<Portfolio> {
+  if (
+    !UUID_PATTERN.test(organizationId) ||
+    (method === 'PATCH' && (!portfolioId || !UUID_PATTERN.test(portfolioId))) ||
+    (method === 'POST' && portfolioId !== undefined)
+  ) {
+    throw new PortfoliosRequestError('Choose a valid portfolio first.', 400);
+  }
+  const keys = Object.keys(fields);
+  const name = fields.name?.trim();
+  if (
+    keys.length === 0 ||
+    keys.some((key) => key !== 'name' && key !== 'status') ||
+    (fields.name !== undefined &&
+      (!name || name.length > 200)) ||
+    (fields.status !== undefined &&
+      fields.status !== 'active' &&
+      fields.status !== 'inactive') ||
+    (method === 'POST' && !name)
+  ) {
+    throw new PortfoliosRequestError('Enter valid portfolio details.', 400);
+  }
+  const body: Partial<PortfolioEditableFields> = { ...fields };
+  if (fields.name !== undefined) body.name = name;
+  const query = new URLSearchParams({ organizationId });
+  const path =
+    method === 'POST'
+      ? `/api/portfolios?${query}`
+      : `/api/portfolios/${encodeURIComponent(portfolioId ?? '')}?${query}`;
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new PortfoliosRequestError(
+      'Portfolio changes could not be submitted. Please try again.',
+      0,
+    );
+  }
+  if (response.status === 401) {
+    throw new PortfoliosRequestError('Your session has expired.', 401);
+  }
+  if (response.status === 403) {
+    throw new PortfoliosRequestError(
+      'You do not have permission to change portfolios.',
+      403,
+    );
+  }
+  if (response.status === 404) {
+    throw new PortfoliosRequestError('Portfolio not found.', 404);
+  }
+  if (!response.ok) {
+    throw new PortfoliosRequestError(
+      response.status === 503
+        ? 'The portfolio service is temporarily unavailable. Please try again.'
+        : 'Portfolio details could not be saved. Please review your changes.',
+      response.status,
+    );
+  }
+  try {
+    const payload: unknown = await response.json();
+    const expectedId =
+      portfolioId ??
+      (isRecord(payload) && typeof payload.id === 'string' ? payload.id : '');
+    return parsePortfolio(payload, organizationId, expectedId);
+  } catch {
+    throw new PortfoliosRequestError(
+      'The saved portfolio could not be verified.',
+      502,
+    );
+  }
+}
+
+export function createPortfolio(
+  organizationId: string,
+  fields: PortfolioEditableFields,
+): Promise<Portfolio> {
+  return writePortfolio('POST', organizationId, fields);
+}
+
+export function updatePortfolio(
+  portfolioId: string,
+  organizationId: string,
+  fields: Partial<PortfolioEditableFields>,
+): Promise<Portfolio> {
+  return writePortfolio('PATCH', organizationId, fields, portfolioId);
 }
 
 export function fetchSites(

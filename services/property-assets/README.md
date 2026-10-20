@@ -24,6 +24,14 @@ Configure `ORGANIZATION_ACCESS_URL` as the Organization & Access base URL. `ORGA
 
 `GET /api/v1/portfolios/{portfolio_id}?organization_id=<UUID>` uses the same user bearer token, workload token, and `property-assets.portfolios.read` organization decision as listing. The path ID and query organization ID are selectors, not proof of access. The service verifies that Organization & Access authorized the requested organization and retrieves the portfolio using both `id` and the authorized `organization_id`. A missing portfolio and a portfolio belonging to another organization both return the same `404` response. Successful responses use the same minimal `PortfolioResponse` contract as the list endpoint.
 
+## Portfolio writes and audit trail
+
+The Registry exposes `POST /api/v1/portfolios?organization_id=<UUID>` and `PATCH /api/v1/portfolios/{portfolio_id}?organization_id=<UUID>`. Each request independently asks Organization & Access for the matching `property-assets.portfolios.create` or `property-assets.portfolios.update` decision. Active owners and admins may write; active members remain read-only. The client may change only `name` and `status`; unknown, ownership, audit, and system fields are rejected. Updates match both portfolio ID and authorized organization ID, so a cross-organization target is indistinguishable from a missing portfolio.
+
+The Registry owns `portfolio_audit_events`. Successful mutations and their audit rows are written in one database transaction. Each row contains organization ID, portfolio ID, operation, trusted `actor_id` returned by Organization & Access, timestamp, and the names of permitted changed fields. Field values, credentials, and bearer tokens are not recorded. Apply the current Registry Alembic head before using write routes.
+
+The same-origin Next.js BFF provides `GET /api/portfolio-write-permissions?organizationId=<UUID>`, `POST /api/portfolios?organizationId=<UUID>`, and `PATCH /api/portfolios/{portfolioId}?organizationId=<UUID>`. Its cookie-authenticated write handlers require the request `Origin` to exactly match `APP_ORIGIN`; they keep Cognito tokens server-side, restrict upstream destinations to the configured Registry origin, bound request size and time, reject redirects, and return no-store sanitized responses.
+
 ## Protected property hierarchy
 
 The following read-only endpoints use the same user authentication and `property-assets.portfolios.read` organization decision:

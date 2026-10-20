@@ -3,6 +3,7 @@ import ipaddress
 import json
 import math
 import re
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -13,7 +14,15 @@ from app import config
 from app.workload_token import WorkloadTokenError, get_workload_access_token
 
 
-DECISION_OPERATION = "property-assets.portfolios.read"
+PortfolioOperation = Literal[
+    "property-assets.portfolios.read",
+    "property-assets.portfolios.create",
+    "property-assets.portfolios.update",
+]
+READ_OPERATION: PortfolioOperation = "property-assets.portfolios.read"
+CREATE_OPERATION: PortfolioOperation = "property-assets.portfolios.create"
+UPDATE_OPERATION: PortfolioOperation = "property-assets.portfolios.update"
+WRITE_OPERATIONS = (CREATE_OPERATION, UPDATE_OPERATION)
 DECISION_PATH = "/internal/v1/authorization/decisions"
 _JWT_ACCESS_TOKEN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 
@@ -33,6 +42,13 @@ class AuthorizationDependencyUnavailable(Exception):
 @dataclass(frozen=True)
 class AuthorizedOrganization:
     organization_id: UUID
+    actor_id: UUID
+
+
+@dataclass(frozen=True)
+class PortfolioWritePermissions:
+    can_create: bool
+    can_update: bool
 
 
 def get_user_bearer_token(request: Request) -> str:
@@ -99,6 +115,7 @@ def require_organization_authorization(
     organization_id: UUID,
     user_token: str,
     workload_token: str,
+    operation: PortfolioOperation = READ_OPERATION,
 ) -> AuthorizedOrganization:
     decision_url = _decision_url()
     try:
@@ -108,7 +125,7 @@ def require_organization_authorization(
             decision_url,
             json={
                 "organization_id": str(organization_id),
-                "operation": DECISION_OPERATION,
+                "operation": operation,
             },
             headers={
                 "Authorization": f"Bearer {user_token}",
@@ -140,6 +157,7 @@ def require_organization_authorization(
         "organization_id",
         "operation",
         "allowed",
+        "actor_id",
     }:
         raise AuthorizationDependencyUnavailable
 
@@ -147,17 +165,23 @@ def require_organization_authorization(
         if not isinstance(decision["organization_id"], str):
             raise ValueError
         returned_organization_id = UUID(decision["organization_id"])
+        if not isinstance(decision["actor_id"], str):
+            raise ValueError
+        actor_id = UUID(decision["actor_id"])
     except (ValueError, TypeError, AttributeError):
         raise AuthorizationDependencyUnavailable from None
     if (
         type(decision["allowed"]) is not bool
         or decision["allowed"] is not True
         or returned_organization_id != organization_id
-        or decision["operation"] != DECISION_OPERATION
+        or decision["operation"] != operation
     ):
         raise AuthorizationDependencyUnavailable
 
-    return AuthorizedOrganization(organization_id=organization_id)
+    return AuthorizedOrganization(
+        organization_id=organization_id,
+        actor_id=actor_id,
+    )
 
 
 def get_authorization_workload_token() -> str:
@@ -176,4 +200,53 @@ def get_authorized_organization(
         organization_id,
         user_token,
         workload_token,
+    )
+
+
+def portfolio_write_authorization(operation: PortfolioOperation):
+    if operation not in WRITE_OPERATIONS:
+        raise ValueError("A portfolio write operation is required.")
+
+    def dependency(
+        organization_id: UUID = Query(...),
+        user_token: str = Depends(get_user_bearer_token),
+        workload_token: str = Depends(get_authorization_workload_token),
+    ) -> AuthorizedOrganization:
+        return require_organization_authorization(
+            organization_id,
+            user_token,
+            workload_token,
+            operation,
+        )
+
+    return dependency
+
+
+def get_portfolio_write_permissions(
+    organization_id: UUID,
+    user_token: str,
+    workload_token: str,
+) -> PortfolioWritePermissions:
+    require_organization_authorization(
+        organization_id,
+        user_token,
+        workload_token,
+        READ_OPERATION,
+    )
+
+    def allowed(operation: PortfolioOperation) -> bool:
+        try:
+            require_organization_authorization(
+                organization_id,
+                user_token,
+                workload_token,
+                operation,
+            )
+        except OrganizationAccessDenied:
+            return False
+        return True
+
+    return PortfolioWritePermissions(
+        can_create=allowed(CREATE_OPERATION),
+        can_update=allowed(UPDATE_OPERATION),
     )

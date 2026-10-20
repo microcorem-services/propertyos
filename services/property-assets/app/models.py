@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
+    JSON,
     Index,
     Numeric,
     String,
@@ -74,6 +75,40 @@ class Portfolio(Base):
     )
 
     sites: Mapped[list["Site"]] = relationship(back_populates="portfolio")
+
+
+class PortfolioAuditEvent(Base):
+    __tablename__ = "portfolio_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "operation IN ('property-assets.portfolios.create', "
+            "'property-assets.portfolios.update')",
+            name="ck_portfolio_audit_operation",
+        ),
+        Index(
+            "ix_portfolio_audit_organization_portfolio",
+            "organization_id",
+            "portfolio_id",
+        ),
+        Index("ix_portfolio_audit_occurred_at", "occurred_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    portfolio_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)
 
 
 class SiteStatus(StrEnum):

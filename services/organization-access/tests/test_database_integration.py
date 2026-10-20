@@ -871,7 +871,7 @@ def test_organization_endpoint_database_failure_returns_sanitized_503(
 def test_internal_decision_requires_active_member_and_both_credentials(
     internal_authorization_client, session: Session
 ):
-    organization, _, _ = create_member(session)
+    organization, user, _ = create_member(session)
     client, make_token, request_headers = internal_authorization_client
 
     response = client.post(
@@ -895,7 +895,51 @@ def test_internal_decision_requires_active_member_and_both_credentials(
         "organization_id": str(organization.id),
         "operation": "property-assets.portfolios.read",
         "allowed": True,
+        "actor_id": str(user.id),
     }
+
+
+@pytest.mark.parametrize(
+    ("operation", "role", "expected_status"),
+    [
+        ("property-assets.portfolios.read", MembershipRole.MEMBER, 200),
+        ("property-assets.portfolios.create", MembershipRole.MEMBER, 403),
+        ("property-assets.portfolios.update", MembershipRole.MEMBER, 403),
+        ("property-assets.portfolios.create", MembershipRole.ADMIN, 200),
+        ("property-assets.portfolios.update", MembershipRole.ADMIN, 200),
+        ("property-assets.portfolios.create", MembershipRole.OWNER, 200),
+        ("property-assets.portfolios.update", MembershipRole.OWNER, 200),
+    ],
+)
+def test_internal_portfolio_operations_enforce_membership_roles(
+    internal_authorization_client,
+    session: Session,
+    operation: str,
+    role: MembershipRole,
+    expected_status: int,
+):
+    organization, user, _ = create_member(session, role=role.value)
+    client, make_token, request_headers = internal_authorization_client
+
+    response = client.post(
+        "/internal/v1/authorization/decisions",
+        json={"organization_id": str(organization.id), "operation": operation},
+        headers=request_headers(
+            user_token=make_token(),
+            workload_token=make_token(
+                client_id="fictional-service-client",
+                scope="property-assets/authorization",
+                subject=None,
+            ),
+        ),
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json()["actor_id"] == str(user.id)
+        assert response.json()["operation"] == operation
+    else:
+        assert response.json()["error"]["code"] == "forbidden"
 
 
 @pytest.mark.parametrize(

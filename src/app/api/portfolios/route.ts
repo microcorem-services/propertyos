@@ -9,3 +9,9 @@ export async function GET(request: Request): Promise<Response> {
     sessions: () => getAuthSessionManagers().authenticated,
   }).getPortfolios(request);
 }
+
+export async function POST(request: Request): Promise<Response> {
+  return createPortfolioHandlers({
+    sessions: () => getAuthSessionManagers().authenticated,
+  }).createPortfolio(request);
+}

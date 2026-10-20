@@ -25,7 +25,7 @@ from app.authorization import (
     require_organization_membership,
 )
 from app.config import SERVICE_NAME
-from app.models import Organization, OrganizationStatus
+from app.models import MembershipRole, Organization, OrganizationStatus
 from app.schemas import (
     APIErrorResponse,
     InternalAuthorizationDecisionRequest,
@@ -184,15 +184,22 @@ def decide_internal_authorization(
     principal: AuthenticatedPrincipal = Depends(verify_access_token),
     session: Session = Depends(get_authorization_session),
 ) -> InternalAuthorizationDecisionResponse:
+    permitted_roles = (
+        None
+        if decision.operation == "property-assets.portfolios.read"
+        else {MembershipRole.OWNER, MembershipRole.ADMIN}
+    )
     authorized = authorize_organization_membership(
         decision.organization_id,
         principal,
         session,
+        permitted_roles=permitted_roles,
     )
     return InternalAuthorizationDecisionResponse(
         organization_id=authorized.organization_id,
         operation=decision.operation,
         allowed=True,
+        actor_id=authorized.user_id,
     )
 
 

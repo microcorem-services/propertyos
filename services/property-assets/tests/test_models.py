@@ -19,6 +19,7 @@ from app.models import (
     Building,
     BuildingStatus,
     Portfolio,
+    PortfolioAuditEvent,
     PortfolioStatus,
     Site,
     SiteStatus,
@@ -28,7 +29,13 @@ from app.models import (
 
 
 def test_portfolio_table_and_uuid_primary_key_are_declared():
-    assert set(Base.metadata.tables) == {"portfolios", "sites", "buildings", "units"}
+    assert set(Base.metadata.tables) == {
+        "portfolios",
+        "portfolio_audit_events",
+        "sites",
+        "buildings",
+        "units",
+    }
 
     for model in (Portfolio, Site, Building, Unit):
         primary_key = model.__table__.c.id
@@ -52,6 +59,21 @@ def test_portfolio_required_fields_and_timestamps_are_utc_aware():
         Portfolio.__table__.c.updated_at.onupdate.arg(None).utcoffset()
         == UTC.utcoffset(None)
     )
+
+
+def test_portfolio_audit_records_have_required_nonsecret_fields():
+    columns = PortfolioAuditEvent.__table__.c
+    assert {
+        "id",
+        "organization_id",
+        "portfolio_id",
+        "operation",
+        "actor_id",
+        "occurred_at",
+        "changed_fields",
+    } == set(columns.keys())
+    assert all(not columns[name].nullable for name in columns.keys())
+    assert "portfolio_audit_events" in Base.metadata.tables
 
 
 def test_portfolio_organization_id_is_indexed_without_cross_service_foreign_key():

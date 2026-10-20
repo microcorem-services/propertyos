@@ -57,10 +57,19 @@ class InternalAuthorizationDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     organization_id: UUID
-    operation: Literal["property-assets.portfolios.read"]
+    operation: Literal[
+        "property-assets.portfolios.read",
+        "property-assets.portfolios.create",
+        "property-assets.portfolios.update",
+    ]
 
 
 class InternalAuthorizationDecisionResponse(BaseModel):
     organization_id: UUID
-    operation: Literal["property-assets.portfolios.read"]
+    operation: Literal[
+        "property-assets.portfolios.read",
+        "property-assets.portfolios.create",
+        "property-assets.portfolios.update",
+    ]
     allowed: Literal[True]
+    actor_id: UUID

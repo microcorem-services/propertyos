@@ -2,7 +2,9 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models import (
     BuildingStatus,
@@ -10,6 +12,33 @@ from app.models import (
     SiteStatus,
     UnitStatus,
 )
+
+
+class PortfolioWriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=200)
+    status: Literal["active", "inactive"] = "active"
+
+
+class PortfolioUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    status: Literal["active", "inactive"] | None = None
+
+    @field_validator("name", "status")
+    @classmethod
+    def reject_null_values(cls, value):
+        if value is None:
+            raise ValueError("Fields cannot be null.")
+        return value
+
+    @model_validator(mode="after")
+    def require_editable_fields(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one editable field is required.")
+        return self
 
 
 class PortfolioResponse(BaseModel):
@@ -21,6 +50,11 @@ class PortfolioResponse(BaseModel):
     status: PortfolioStatus
     created_at: datetime
     updated_at: datetime
+
+
+class PortfolioWritePermissionsResponse(BaseModel):
+    can_create: bool
+    can_update: bool
 
 
 class SiteResponse(BaseModel):

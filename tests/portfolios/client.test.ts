@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   fetchPortfolio,
+  fetchPortfolioWritePermissions,
   fetchPortfolios,
+  createPortfolio,
+  updatePortfolio,
   fetchSite,
   fetchSites,
   fetchBuilding,
@@ -217,6 +220,88 @@ test('rejects incorrect portfolio IDs, wrong organization records and detail err
           error.status === expectedStatus &&
           !error.message.includes('sensitive Registry detail'),
       );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('reads validated portfolio write capabilities from the same-origin BFF', async () => {
+  const originalFetch = globalThis.fetch;
+  let url = '';
+  let options: RequestInit | undefined;
+  try {
+    globalThis.fetch = async (input, init) => {
+      url = String(input);
+      options = init;
+      return Response.json({ can_create: true, can_update: false });
+    };
+    assert.deepEqual(await fetchPortfolioWritePermissions(organizationId), {
+      can_create: true,
+      can_update: false,
+    });
+    assert.equal(
+      url,
+      `/api/portfolio-write-permissions?organizationId=${organizationId}`,
+    );
+    assert.equal(options?.credentials, 'same-origin');
+    assert.equal(options?.cache, 'no-store');
+    assert.equal(options?.redirect, 'error');
+
+    globalThis.fetch = async () =>
+      Response.json({ can_create: true, can_update: false, role: 'admin' });
+    await assert.rejects(
+      fetchPortfolioWritePermissions(organizationId),
+      (error: unknown) =>
+        error instanceof PortfoliosRequestError && error.status === 502,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('creates and updates portfolios using only editable fields and verifies responses', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  try {
+    globalThis.fetch = async (input, init) => {
+      calls.push({ url: String(input), init });
+      return Response.json({ ...portfolio, name: 'Renamed portfolio' });
+    };
+    assert.deepEqual(
+      await createPortfolio(organizationId, {
+        name: 'Renamed portfolio',
+        status: 'active',
+      }),
+      { ...portfolio, name: 'Renamed portfolio' },
+    );
+    assert.deepEqual(
+      await updatePortfolio(portfolio.id, organizationId, {
+        name: 'Renamed portfolio',
+      }),
+      { ...portfolio, name: 'Renamed portfolio' },
+    );
+    assert.equal(calls[0].url, `/api/portfolios?organizationId=${organizationId}`);
+    assert.equal(calls[0].init?.method, 'POST');
+    assert.equal(calls[1].url, `/api/portfolios/${portfolio.id}?organizationId=${organizationId}`);
+    assert.equal(calls[1].init?.method, 'PATCH');
+    assert.equal(calls[0].init?.credentials, 'same-origin');
+    assert.equal(calls[0].init?.cache, 'no-store');
+    assert.equal(calls[0].init?.redirect, 'error');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      name: 'Renamed portfolio',
+      status: 'active',
+    });
+    assert.deepEqual(JSON.parse(String(calls[1].init?.body)), {
+      name: 'Renamed portfolio',
+    });
+    for (const invalid of [
+      () => createPortfolio(organizationId, { name: ' ', status: 'active' }),
+      () => createPortfolio(organizationId, { name: 'Name', status: 'active', organization_id: organizationId } as never),
+      () => updatePortfolio('not-a-uuid', organizationId, { name: 'Name' }),
+      () => updatePortfolio(portfolio.id, organizationId, { status: 'pending' } as never),
+    ]) {
+      await assert.rejects(invalid, PortfoliosRequestError);
     }
   } finally {
     globalThis.fetch = originalFetch;
