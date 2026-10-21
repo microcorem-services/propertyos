@@ -18,6 +18,7 @@ from app.models import (
     InvoiceAuditEvent,
     InvoiceLine,
     Lease,
+    Payment,
     PaymentAllocation,
 )
 from app.schemas import PaymentCreateRequest
