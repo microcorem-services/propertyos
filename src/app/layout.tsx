@@ -3,6 +3,7 @@ import { Manrope, Plus_Jakarta_Sans } from 'next/font/google';
 import './styles.css';
 import './phase2.css';
 import './bow-era.css';
+import './leases.css';
 
 const plusJakarta = Plus_Jakarta_Sans({
   subsets: ['latin'],

@@ -148,7 +148,7 @@ class LeaseUnitResponse(BaseModel):
     site_id: UUID
     building_id: UUID
     unit_id: UUID
-    verified_status: Literal["active"]
+    verified_status: Literal["active", "unavailable"]
 
 
 class LeaseAuditEventResponse(BaseModel):
@@ -156,6 +156,37 @@ class LeaseAuditEventResponse(BaseModel):
     event_type: Literal["created", "updated"]
     changed_fields: list[str]
     occurred_at: datetime
+
+
+class LeaseSummaryUnitResponse(BaseModel):
+    portfolio_id: UUID
+    site_id: UUID
+    building_id: UUID
+    unit_id: UUID
+
+
+class LeaseSummaryResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    lease_reference: str
+    start_date: date
+    expiry_date: date
+    break_date: date | None
+    rent_amount: str
+    currency: str
+    payment_frequency: str
+    status: str
+    units: list[LeaseSummaryUnitResponse]
+    parties: list[LeasePartyResponse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class LeaseListResponse(BaseModel):
+    items: list[LeaseSummaryResponse]
+    total: int
+    limit: int
+    offset: int
 
 
 class LeaseResponse(BaseModel):

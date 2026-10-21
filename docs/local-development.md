@@ -86,4 +86,26 @@ Use a different `SERVICE_PORT` and `--port` for the Property & Asset Registry (d
 
 ## Existing Phase 2 application
 
-The Next.js app and original FastAPI/PostgreSQL backend remain at the repository root and in `backend/`. They are not moved or replaced by these service skeletons. Continue to use the existing README instructions for the Phase 2 UI and backend. The Next.js frontend still calls the original backend; the new services are not wired into it yet.
+The Next.js app and original FastAPI/PostgreSQL backend remain at the repository root and in `backend/`. They are not moved or replaced by these service foundations. Continue to use the existing README instructions for the Phase 2 UI and backend. The M0.9-B lease interface uses a same-origin BFF route to connect to Lease Management; the rest of the existing Phase 2 behavior is unchanged.
+
+## Lease Management browser interface
+
+The Next.js app includes the M0.9-B lease register and create, view, and update
+screens. To connect a locally running Next.js app to the local Lease Management
+service, set these server-side variables in the Next.js process environment
+(for example, in the ignored root `.env.local` file):
+
+```dotenv
+LEASE_MANAGEMENT_URL=http://127.0.0.1:8103
+LEASE_MANAGEMENT_ALLOW_INSECURE_LOCAL_HTTP=true
+LEASE_MANAGEMENT_TIMEOUT_MS=3000
+```
+
+The insecure HTTP setting is for loopback development only; production requires
+HTTPS. The browser calls only same-origin `/api/leases` routes. The Next.js BFF
+uses the existing authenticated session; Lease Management independently checks
+organization permissions and uses its configured workload identity for its
+service-to-service calls. The local Lease service, database, Cognito workload
+configuration, Organization & Access, and Property & Asset Registry must be
+running and configured for authenticated read/write operations. Never put
+workload credentials in client-side variables such as `NEXT_PUBLIC_*`.

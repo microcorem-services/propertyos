@@ -5,7 +5,18 @@ export const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'http://localhost/',
 });
 
+Object.defineProperty(dom.window, 'requestIdleCallback', {
+  configurable: true,
+  value: (callback: (deadline: { didTimeout: boolean; timeRemaining: () => number }) => void) =>
+    setTimeout(() => callback({ didTimeout: false, timeRemaining: () => 0 }), 1),
+});
+Object.defineProperty(dom.window, 'cancelIdleCallback', {
+  configurable: true,
+  value: (handle: ReturnType<typeof setTimeout>) => clearTimeout(handle),
+});
+
 Object.defineProperties(globalThis, {
+  self: { configurable: true, value: dom.window },
   window: { configurable: true, value: dom.window },
   document: { configurable: true, value: dom.window.document },
   navigator: { configurable: true, value: dom.window.navigator },

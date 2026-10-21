@@ -22,6 +22,8 @@ Tests use an in-memory SQLite database and mocked service boundaries; they do no
 ## API foundation
 
 - `POST /api/v1/organizations/{organization_id}/leases`
+- `GET /api/v1/organizations/{organization_id}/leases` (bounded register, search, status filtering, sorting, and pagination)
+- `GET /api/v1/organizations/{organization_id}/lease-permissions`
 - `GET /api/v1/organizations/{organization_id}/leases/{lease_id}`
 - `PATCH /api/v1/organizations/{organization_id}/leases/{lease_id}`
 
@@ -29,7 +31,7 @@ The organization identifier in the route is only a lookup scope. Every request r
 
 The API records rent using `Decimal` and PostgreSQL `NUMERIC(14, 2)`, requires one landlord and one or more tenants, supports multiple Units and joint tenants, and restricts currencies to GBP, EUR, and USD. The currency allowlist is an initial product decision, not a statement about tender requirements.
 
-Each supplied Unit includes its Registry hierarchy identifiers. Before a create, update, or read, the service makes a bounded authenticated request to the Property & Asset Registry and checks that the Unit is active and that the returned Unit, organization, and building identities match. Authorization and Registry failures fail closed. Current Unit paths and identifiers are kept as organization-scoped references; there is deliberately no cross-service foreign key.
+Each supplied Unit includes its Registry hierarchy identifiers. Before a create or changed Unit association, and when reading a lease, the service makes a bounded authenticated request to the Property & Asset Registry and checks that the Unit is active and that the returned Unit, organization, and building identities match. If a formerly valid Unit is now unavailable, the detail response marks it `unavailable` without disclosing a reason, so an authorised user can terminate the lease or replace its Unit association. Registry service failures still fail closed. Current Unit paths and identifiers are kept as organization-scoped references; there is deliberately no cross-service foreign key.
 
 The Registry also asks the authenticated Lease Management API before deactivating a Unit; it refuses deactivation while any draft or active lease references that Unit and fails closed if Lease Management is unavailable. The Registry currently has no Unit deletion API. A stale lease can still be terminated to release the reference. These checks and lease-side revalidation detect stale references, but they cannot prevent a concurrent lease creation and Unit deactivation race. Eliminating that race requires a cross-service reservation/retirement protocol with compensation and reconciliation; this milestone does not claim an atomic cross-service guarantee.
 
@@ -41,4 +43,4 @@ No Oxford City Council OCC001059 tender specification was found in the local rep
 
 Implemented: organization-scoped lease references, term dates and optional break date, bounded lifecycle status, decimal rent and currency, payment frequency, landlord/tenant/guarantor records, multiple Unit associations, joint tenants, create/read/update, and transactional audit history.
 
-Deferred: payment schedules and reconciliation, indexation and rent reviews, break/renewal notices, document storage, contact details, global party identity resolution, search/list and pagination, event publication, automated expiry transitions, and the Registry Unit reservation protocol needed to eliminate concurrent change races.
+Deferred: payment schedules and reconciliation, indexation and rent reviews, break/renewal notices, document storage, contact details, global party identity resolution, event publication, automated expiry transitions, and the Registry Unit reservation protocol needed to eliminate concurrent change races.

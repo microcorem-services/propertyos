@@ -1,8 +1,8 @@
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from sqlalchemy import select, text
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
@@ -11,8 +11,11 @@ from app.models import Lease, LeaseAuditEvent, LeaseParty, LeaseUnit
 from app.schemas import (
     LeaseAuditEventResponse,
     LeaseCreateRequest,
+    LeaseListResponse,
     LeasePartyResponse,
     LeaseResponse,
+    LeaseSummaryResponse,
+    LeaseSummaryUnitResponse,
     LeaseUnitInput,
     LeaseUnitResponse,
     LeaseUpdateRequest,
@@ -22,6 +25,7 @@ from app.security import (
     ServiceDependencyUnavailable,
     UnitReference,
     UnitReferenceInvalid,
+    authorize_request,
     get_create_authorization,
     get_read_authorization,
     get_update_authorization,
@@ -119,29 +123,26 @@ def _verify_units(
     units: list[LeaseUnitInput | LeaseUnit],
     user_token: str,
     *,
-    stale_is_conflict: bool = False,
-) -> None:
+    allow_unavailable: bool = False,
+) -> set[UUID]:
+    unavailable: set[UUID] = set()
     for unit in units:
         try:
             validate_unit_reference(organization_id, _unit_reference(unit), user_token)
         except UnitReferenceInvalid:
+            if allow_unavailable:
+                unavailable.add(unit.unit_id)
+                continue
             raise HTTPException(
-                status_code=(
-                    status.HTTP_409_CONFLICT
-                    if stale_is_conflict
-                    else status.HTTP_422_UNPROCESSABLE_CONTENT
-                ),
-                detail=(
-                    "A referenced Unit is no longer available"
-                    if stale_is_conflict
-                    else "A referenced Unit is invalid or inactive"
-                ),
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="A referenced Unit is invalid or inactive",
             ) from None
         except ServiceDependencyUnavailable:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Property Registry unavailable",
             ) from None
+    return unavailable
 
 
 def _party_models(organization_id: UUID, lease_id: UUID, parties) -> list[LeaseParty]:
@@ -173,7 +174,10 @@ def _unit_models(organization_id: UUID, lease_id: UUID, units) -> list[LeaseUnit
     ]
 
 
-def _response(lease: Lease) -> LeaseResponse:
+def _response(
+    lease: Lease, unavailable_unit_ids: set[UUID] | None = None
+) -> LeaseResponse:
+    unavailable_unit_ids = unavailable_unit_ids or set()
     return LeaseResponse(
         id=lease.id,
         organization_id=lease.organization_id,
@@ -191,7 +195,9 @@ def _response(lease: Lease) -> LeaseResponse:
                 site_id=unit.site_id,
                 building_id=unit.building_id,
                 unit_id=unit.unit_id,
-                verified_status="active",
+                verified_status=(
+                    "unavailable" if unit.unit_id in unavailable_unit_ids else "active"
+                ),
             )
             for unit in lease.units
         ],
@@ -215,6 +221,149 @@ def _response(lease: Lease) -> LeaseResponse:
         ],
         created_at=lease.created_at,
         updated_at=lease.updated_at,
+    )
+
+
+def _summary_response(lease: Lease) -> LeaseSummaryResponse:
+    return LeaseSummaryResponse(
+        id=lease.id,
+        organization_id=lease.organization_id,
+        lease_reference=lease.lease_reference,
+        start_date=lease.start_date,
+        expiry_date=lease.expiry_date,
+        break_date=lease.break_date,
+        rent_amount=f"{Decimal(lease.rent_amount):.2f}",
+        currency=lease.currency,
+        payment_frequency=lease.payment_frequency,
+        status=lease.status,
+        units=[
+            LeaseSummaryUnitResponse(
+                portfolio_id=unit.portfolio_id,
+                site_id=unit.site_id,
+                building_id=unit.building_id,
+                unit_id=unit.unit_id,
+            )
+            for unit in lease.units
+        ],
+        parties=[
+            LeasePartyResponse(
+                id=party.id,
+                legal_name=party.legal_name,
+                role=party.role,
+                party_type=party.party_type,
+            )
+            for party in lease.parties
+        ],
+        created_at=lease.created_at,
+        updated_at=lease.updated_at,
+    )
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/lease-permissions",
+)
+def get_lease_permissions(
+    organization_id: UUID,
+    token: str = Depends(get_user_token),
+) -> dict[str, bool]:
+    try:
+        authorize_request(organization_id, "lease-management.leases.read", token)
+    except HTTPException as error:
+        if error.status_code == status.HTTP_403_FORBIDDEN:
+            return {"can_read": False, "can_create": False, "can_update": False}
+        raise
+
+    def allowed(operation: str) -> bool:
+        try:
+            authorize_request(organization_id, operation, token)
+        except HTTPException as error:
+            if error.status_code == status.HTTP_403_FORBIDDEN:
+                return False
+            raise
+        return True
+
+    return {
+        "can_read": True,
+        "can_create": allowed("lease-management.leases.create"),
+        "can_update": allowed("lease-management.leases.update"),
+    }
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases",
+    response_model=LeaseListResponse,
+)
+def list_leases(
+    organization_id: UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+    status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None, min_length=1, max_length=100),
+    sort_by: str = Query(default="updated_at"),
+    sort_direction: str = Query(default="desc"),
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> LeaseListResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if status_filter is not None and status_filter not in {
+        "draft",
+        "active",
+        "expired",
+        "terminated",
+    }:
+        raise HTTPException(status_code=422, detail="Invalid lease status")
+    search_term = search.strip() if search is not None else None
+    if search is not None and not search_term:
+        raise HTTPException(status_code=422, detail="Invalid lease search")
+    sort_columns = {
+        "lease_reference": Lease.lease_reference,
+        "status": Lease.status,
+        "start_date": Lease.start_date,
+        "expiry_date": Lease.expiry_date,
+        "rent_amount": Lease.rent_amount,
+        "updated_at": Lease.updated_at,
+    }
+    if sort_by not in sort_columns or sort_direction not in {"asc", "desc"}:
+        raise HTTPException(status_code=422, detail="Invalid lease sort")
+
+    filters = [Lease.organization_id == organization_id]
+    if status_filter is not None:
+        filters.append(Lease.status == status_filter)
+    if search_term is not None:
+        term = f"%{search_term}%"
+        matching_party = (
+            select(LeaseParty.id)
+            .where(
+                LeaseParty.lease_id == Lease.id,
+                LeaseParty.organization_id == organization_id,
+                LeaseParty.legal_name.ilike(term),
+            )
+            .exists()
+        )
+        filters.append(or_(Lease.lease_reference.ilike(term), matching_party))
+    try:
+        total = session.scalar(select(func.count(Lease.id)).where(*filters)) or 0
+        leases = list(
+            session.scalars(
+                select(Lease)
+                .options(selectinload(Lease.units), selectinload(Lease.parties))
+                .where(*filters)
+                .order_by(
+                    getattr(sort_columns[sort_by], sort_direction)(),
+                    Lease.id.asc(),
+                )
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    return LeaseListResponse(
+        items=[_summary_response(lease) for lease in leases],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -309,8 +458,13 @@ def get_lease(
         _raise_database_unavailable()
     if lease is None:
         raise HTTPException(status_code=404, detail="Lease not found")
-    _verify_units(organization_id, lease.units, user_token, stale_is_conflict=True)
-    return _response(lease)
+    unavailable = _verify_units(
+        organization_id,
+        lease.units,
+        user_token,
+        allow_unavailable=True,
+    )
+    return _response(lease, unavailable)
 
 
 @app.patch(

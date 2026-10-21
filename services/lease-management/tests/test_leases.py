@@ -129,6 +129,96 @@ def test_duplicate_reference_is_organization_scoped_conflict(
         )
 
 
+def test_list_leases_is_organization_scoped_searchable_and_paginated(
+    client, registry_ok
+):
+    organization_id = uuid4()
+    authorize(client, organization_id)
+    url = f"/api/v1/organizations/{organization_id}/leases"
+    headers = {"Authorization": "header.payload.signature"}
+
+    for index in range(3):
+        payload = lease_payload()
+        payload["lease_reference"] = f"LEASE-2026-{index:03}"
+        payload["status"] = "active" if index < 2 else "draft"
+        payload["parties"][1]["legal_name"] = f"Tenant {index}"
+        assert client.post(url, json=payload, headers=headers).status_code == 201
+
+    other_organization = uuid4()
+    authorize(client, other_organization)
+    other_payload = lease_payload()
+    other_payload["lease_reference"] = "PRIVATE-LEASE"
+    assert (
+        client.post(
+            f"/api/v1/organizations/{other_organization}/leases",
+            json=other_payload,
+            headers=headers,
+        ).status_code
+        == 201
+    )
+
+    authorize(client, organization_id)
+    response = client.get(
+        f"{url}?status=active&search=Tenant&limit=1&offset=0&sort_by=lease_reference&sort_direction=asc",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert data["limit"] == 1
+    assert data["offset"] == 0
+    assert len(data["items"]) == 1
+    assert data["items"][0]["organization_id"] == str(organization_id)
+    assert data["items"][0]["status"] == "active"
+    assert "audit_events" not in data["items"][0]
+
+    next_page = client.get(
+        f"{url}?status=active&search=Tenant&limit=1&offset=1&sort_by=lease_reference&sort_direction=asc",
+        headers=headers,
+    )
+    assert next_page.status_code == 200
+    assert next_page.json()["items"][0]["id"] != data["items"][0]["id"]
+
+    invalid_status = client.get(f"{url}?status=all", headers=headers)
+    assert invalid_status.status_code == 422
+    blank_search = client.get(f"{url}?search=%20%20", headers=headers)
+    assert blank_search.status_code == 422
+    oversized_page = client.get(f"{url}?limit=101", headers=headers)
+    assert oversized_page.status_code == 422
+    invalid_sort = client.get(f"{url}?sort_by=organization_id", headers=headers)
+    assert invalid_sort.status_code == 422
+
+
+def test_lease_permissions_use_authorization_decisions(client, monkeypatch):
+    organization_id = uuid4()
+    calls = []
+
+    def allow_operations(org_id, operation, token):
+        calls.append((org_id, operation, token))
+        if operation == "lease-management.leases.update":
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=403)
+        return object()
+
+    monkeypatch.setattr(main, "authorize_request", allow_operations)
+    response = client.get(
+        f"/api/v1/organizations/{organization_id}/lease-permissions",
+        headers={"Authorization": "header.payload.signature"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "can_read": True,
+        "can_create": True,
+        "can_update": False,
+    }
+    assert [call[1] for call in calls] == [
+        "lease-management.leases.read",
+        "lease-management.leases.create",
+        "lease-management.leases.update",
+    ]
+
+
 def test_invalid_dates_precision_and_float_rent_are_rejected(client, registry_ok):
     organization_id = uuid4()
     authorize(client, organization_id)
@@ -188,7 +278,7 @@ def test_registry_unavailable_fails_closed(client, monkeypatch):
     assert response.json()["detail"] == "Property Registry unavailable"
 
 
-def test_registry_stale_unit_on_read_returns_conflict(
+def test_registry_stale_unit_on_read_is_marked_unavailable_and_can_be_terminated(
     client, db_factory, registry_ok, monkeypatch
 ):
     organization_id = uuid4()
@@ -212,8 +302,17 @@ def test_registry_stale_unit_on_read_returns_conflict(
         headers=headers,
     )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "A referenced Unit is no longer available"
+    assert response.status_code == 200
+    assert response.json()["units"][0]["verified_status"] == "unavailable"
+    assert "reason" not in response.json()["units"][0]
+
+    terminated = client.patch(
+        f"/api/v1/organizations/{organization_id}/leases/{created['id']}",
+        json={"status": "terminated"},
+        headers=headers,
+    )
+    assert terminated.status_code == 200
+    assert terminated.json()["status"] == "terminated"
 
 
 def test_internal_retirement_check_is_organization_scoped_and_blocks_active_lease(
