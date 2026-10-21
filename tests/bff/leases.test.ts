@@ -45,6 +45,39 @@ const lease = {
   created_at: '2026-04-01T10:00:00Z',
   updated_at: '2026-04-01T10:00:00Z',
 };
+const rentSchedule = {
+  id: '00000000-0000-4000-8000-000000000801',
+  organization_id: organizationId,
+  lease_id: leaseId,
+  charge_category: 'base_rent',
+  amount_per_period: '12500.50',
+  currency: 'GBP',
+  payment_frequency: 'monthly',
+  start_date: '2026-04-01',
+  end_date: '2026-06-29',
+  due_day: 31,
+  short_month_rule: 'clamp_to_month_end',
+  status: 'draft',
+  manual_review_reasons: ['commencement_not_on_due_date'],
+  installments: [
+    {
+      id: '00000000-0000-4000-8000-000000000901',
+      due_date: '2026-04-30',
+      amount: '12500.50',
+      currency: 'GBP',
+      status: 'expected',
+    },
+    {
+      id: '00000000-0000-4000-8000-000000000902',
+      due_date: '2026-05-31',
+      amount: '12500.50',
+      currency: 'GBP',
+      status: 'expected',
+    },
+  ],
+  created_at: '2026-04-01T10:00:00Z',
+  updated_at: '2026-04-01T10:00:00Z',
+};
 
 function jsonResponse(status: number, payload: unknown): Response {
   return Response.json(payload, { status });
@@ -264,4 +297,132 @@ test('permission endpoint validates exact boolean decisions', async () => {
     ).status,
     502,
   );
+});
+
+test('rent schedule BFF scopes responses to the authenticated organization and lease', async () => {
+  const context = setup({ payload: [rentSchedule] });
+  const path = `/api/leases/${leaseId}/rent-schedules?organizationId=${organizationId}`;
+  const response = await context.handlers.listRentSchedules(
+    context.request(path),
+    leaseId,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), [rentSchedule]);
+  assert.equal(
+    context.requestedUrl()?.href,
+    `https://lease-service.example.test/api/v1/organizations/${organizationId}/leases/${leaseId}/rent-schedules`,
+  );
+  assert.equal(context.requestInit()?.cache, 'no-store');
+
+  const crossOrganization = setup({
+    payload: [{ ...rentSchedule, organization_id: '00000000-0000-4000-8000-000000000002' }],
+  });
+  assert.equal(
+    (
+      await crossOrganization.handlers.listRentSchedules(
+        crossOrganization.request(path),
+        leaseId,
+      )
+    ).status,
+    502,
+  );
+
+  const wrongLease = setup({
+    payload: [{ ...rentSchedule, lease_id: '00000000-0000-4000-8000-000000000102' }],
+  });
+  assert.equal(
+    (
+      await wrongLease.handlers.listRentSchedules(
+        wrongLease.request(path),
+        leaseId,
+      )
+    ).status,
+    502,
+  );
+});
+
+test('rent schedule writes require same-origin session and validate decimal responses', async () => {
+  const fields = {
+    amount_per_period: '12500.50',
+    payment_frequency: 'monthly',
+    start_date: '2026-04-01',
+    end_date: '2026-06-29',
+    due_day: 31,
+    short_month_rule: 'clamp_to_month_end',
+  };
+  const path = `/api/leases/${leaseId}/rent-schedules?organizationId=${organizationId}`;
+  const create = setup({ status: 201, payload: rentSchedule });
+  const response = await create.handlers.createRentSchedule(
+    create.request(path, 'POST', fields),
+    leaseId,
+  );
+  assert.equal(response.status, 201);
+  assert.equal(
+    JSON.parse(String(create.requestInit()?.body)).amount_per_period,
+    '12500.50',
+  );
+
+  const foreignOrigin = setup({ status: 201, payload: rentSchedule });
+  assert.equal(
+    (
+      await foreignOrigin.handlers.createRentSchedule(
+        foreignOrigin.request(path, 'POST', fields, 'https://attacker.example'),
+        leaseId,
+      )
+    ).status,
+    403,
+  );
+  assert.equal(foreignOrigin.calls(), 0);
+
+  const malformed = setup({
+    status: 201,
+    payload: {
+      ...rentSchedule,
+      installments: [
+        ...rentSchedule.installments,
+        { ...rentSchedule.installments[0] },
+      ],
+    },
+  });
+  assert.equal(
+    (
+      await malformed.handlers.createRentSchedule(
+        malformed.request(path, 'POST', fields),
+        leaseId,
+      )
+    ).status,
+    502,
+  );
+});
+
+test('rent schedule generation requests are session authenticated and idempotency is forwarded', async () => {
+  const path = `/api/leases/${leaseId}/rent-schedules/${rentSchedule.id}/generate?organizationId=${organizationId}`;
+  const context = setup({ payload: rentSchedule });
+  const generated = await context.handlers.generateRentSchedule(
+    context.request(path, 'POST'),
+    leaseId,
+    rentSchedule.id,
+  );
+  assert.equal(generated.status, 200);
+  assert.equal(
+    context.requestedUrl()?.pathname,
+    `/api/v1/organizations/${organizationId}/leases/${leaseId}/rent-schedules/${rentSchedule.id}/generate`,
+  );
+  assert.equal(
+    new Headers(context.requestInit()?.headers).get('authorization'),
+    `Bearer ${token}`,
+  );
+
+  const noSession = setup({ session: null });
+  assert.equal(
+    (
+      await noSession.handlers.generateRentSchedule(
+        noSession.request(path, 'POST'),
+        leaseId,
+        rentSchedule.id,
+      )
+    ).status,
+    401,
+  );
+  assert.equal(noSession.calls(), 0);
 });

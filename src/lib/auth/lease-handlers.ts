@@ -124,7 +124,14 @@ function isLeaseRecord(
       (event) =>
         isRecord(event) &&
         isUUID(event.actor_id) &&
-        (event.event_type === 'created' || event.event_type === 'updated') &&
+        [
+          'created',
+          'updated',
+          'rent_schedule_created',
+          'rent_schedule_updated',
+          'rent_schedule_activated',
+          'rent_schedule_generated',
+        ].includes(String(event.event_type)) &&
         Array.isArray(event.changed_fields) &&
         event.changed_fields.every((field) => typeof field === 'string') &&
         isTimestamp(event.occurred_at),
@@ -155,6 +162,74 @@ function isLeaseSummary(value: unknown, organizationId: string): boolean {
     Array.isArray(value.parties) &&
     value.parties.length <= 100 &&
     value.parties.every(isParty) &&
+    isTimestamp(value.created_at) &&
+    isTimestamp(value.updated_at)
+  );
+}
+
+function isRentSchedule(
+  value: unknown,
+  organizationId: string,
+  leaseId: string,
+): boolean {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.installments) ||
+    value.installments.length === 0 ||
+    value.installments.length > 1200
+  ) {
+    return false;
+  }
+  const dueDates = new Set<string>();
+  let previousDueDate = '';
+  const installmentsValid = value.installments.every((item) => {
+    if (
+      !isRecord(item) ||
+      !isUUID(item.id) ||
+      !isDate(item.due_date) ||
+      item.due_date < String(value.start_date) ||
+      item.due_date > String(value.end_date) ||
+      typeof item.amount !== 'string' ||
+      !/^\d{1,12}\.\d{2}$/.test(item.amount) ||
+      item.amount !== value.amount_per_period ||
+      !CURRENCIES.has(String(item.currency)) ||
+      item.currency !== value.currency ||
+      item.status !== 'expected' ||
+      dueDates.has(item.due_date) ||
+      item.due_date < previousDueDate
+    ) {
+      return false;
+    }
+    dueDates.add(item.due_date);
+    previousDueDate = item.due_date;
+    return true;
+  });
+  return (
+    isUUID(value.id) &&
+    isUUID(value.organization_id) &&
+    value.organization_id.toLowerCase() === organizationId.toLowerCase() &&
+    isUUID(value.lease_id) &&
+    value.lease_id.toLowerCase() === leaseId.toLowerCase() &&
+    value.charge_category === 'base_rent' &&
+    typeof value.amount_per_period === 'string' &&
+    /^\d{1,12}\.\d{2}$/.test(value.amount_per_period) &&
+    CURRENCIES.has(String(value.currency)) &&
+    FREQUENCIES.has(String(value.payment_frequency)) &&
+    isDate(value.start_date) &&
+    isDate(value.end_date) &&
+    value.end_date >= value.start_date &&
+    Number.isInteger(value.due_day) &&
+    Number(value.due_day) >= 1 &&
+    Number(value.due_day) <= 31 &&
+    value.short_month_rule === 'clamp_to_month_end' &&
+    (value.status === 'draft' || value.status === 'active') &&
+    Array.isArray(value.manual_review_reasons) &&
+    value.manual_review_reasons.every(
+      (reason) =>
+        reason === 'commencement_not_on_due_date' ||
+        reason === 'end_not_on_period_boundary',
+    ) &&
+    installmentsValid &&
     isTimestamp(value.created_at) &&
     isTimestamp(value.updated_at)
   );
@@ -315,10 +390,18 @@ async function readJsonResponse(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
 }
 
-function statusError(status: number, detail: 'list' | 'detail' | 'write'): Response {
+function statusError(
+  status: number,
+  detail: 'list' | 'detail' | 'write' | 'schedule',
+): Response {
   if (status === 401) return errorResponse(401, 'Authentication required.');
   if (status === 403) return errorResponse(403, 'Organisation access denied.');
-  if (status === 404) return errorResponse(404, 'Lease not found.');
+  if (status === 404) {
+    return errorResponse(
+      404,
+      detail === 'schedule' ? 'Rent schedule not found.' : 'Lease not found.',
+    );
+  }
   if (status === 409) return errorResponse(409, 'Lease conflicts with existing data.');
   if (status === 422) return errorResponse(400, 'Lease information is invalid.');
   return errorResponse(
@@ -340,7 +423,7 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     organizationId: string,
     expectedStatus: number,
     body?: unknown,
-    detail: 'list' | 'detail' | 'write' = 'detail',
+    detail: 'list' | 'detail' | 'write' | 'schedule' = 'detail',
   ): Promise<Response> {
     try {
       const token = await readAccessToken(request, dependencies.sessions, now);
@@ -366,7 +449,9 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
         return errorResponse(502, 'Invalid Lease Management response.');
       }
       const payload = await readJsonResponse(upstream);
-      if (!isRecord(payload)) return errorResponse(502, 'Invalid Lease Management response.');
+      if (!isRecord(payload) && !Array.isArray(payload)) {
+        return errorResponse(502, 'Invalid Lease Management response.');
+      }
       return Response.json(payload, {
         status: expectedStatus,
         headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
@@ -489,6 +574,104 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     });
   }
 
+  function scheduleContext(
+    request: Request,
+    leaseId: string,
+  ): { organizationId: string; path: string } | Response {
+    const url = new URL(request.url);
+    const organizationId = readOrganizationId(url);
+    if (
+      !organizationId ||
+      !isUUID(leaseId) ||
+      [...url.searchParams.keys()].some((key) => key !== 'organizationId') ||
+      url.searchParams.getAll('organizationId').length !== 1
+    ) {
+      return errorResponse(400, 'Invalid rent schedule request.');
+    }
+    return {
+      organizationId,
+      path: `${API_PREFIX}/${organizationId}/leases/${leaseId}/rent-schedules`,
+    };
+  }
+
+  async function listRentSchedules(
+    request: Request,
+    leaseId: string,
+  ): Promise<Response> {
+    const context = scheduleContext(request, leaseId);
+    if (context instanceof Response) return context;
+    const response = await perform(
+      request,
+      'GET',
+      context.path,
+      context.organizationId,
+      200,
+      undefined,
+      'schedule',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (
+      !Array.isArray(payload) ||
+      payload.some(
+        (schedule) =>
+          !isRentSchedule(schedule, context.organizationId, leaseId),
+      )
+    ) {
+      return errorResponse(502, 'Invalid Rent Management response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function writeRentSchedule(
+    request: Request,
+    leaseId: string,
+    scheduleId: string | undefined,
+    operation: 'create' | 'update' | 'generate',
+  ): Promise<Response> {
+    const context = scheduleContext(request, leaseId);
+    if (context instanceof Response) return context;
+    if (scheduleId !== undefined && !isUUID(scheduleId)) {
+      return errorResponse(400, 'Invalid rent schedule request.');
+    }
+    try {
+      if (!isSameOriginWriteRequest(request, (dependencies.appOrigin ?? loadAppOrigin)())) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      const body =
+        operation === 'generate' ? undefined : await readJsonBody(request);
+      const expectedStatus = operation === 'create' ? 201 : 200;
+      const method =
+        operation === 'update' ? 'PATCH' : 'POST';
+      const path =
+        operation === 'create'
+          ? context.path
+          : `${context.path}/${scheduleId}${operation === 'generate' ? '/generate' : ''}`;
+      const response = await perform(
+        request,
+        method,
+        path,
+        context.organizationId,
+        expectedStatus,
+        body,
+        'schedule',
+      );
+      if (response.status !== expectedStatus) return response;
+      const payload: unknown = await response.json();
+      if (!isRentSchedule(payload, context.organizationId, leaseId)) {
+        return errorResponse(502, 'Invalid Rent Management response.');
+      }
+      return Response.json(payload, {
+        status: expectedStatus,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(400, 'Invalid rent schedule request.');
+    }
+  }
+
   async function detail(
     request: Request,
     leaseId: string,
@@ -572,6 +755,19 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
   return {
     getPermissions,
     list,
+    listRentSchedules,
+    createRentSchedule: (request: Request, leaseId: string) =>
+      writeRentSchedule(request, leaseId, undefined, 'create'),
+    updateRentSchedule: (
+      request: Request,
+      leaseId: string,
+      scheduleId: string,
+    ) => writeRentSchedule(request, leaseId, scheduleId, 'update'),
+    generateRentSchedule: (
+      request: Request,
+      leaseId: string,
+      scheduleId: string,
+    ) => writeRentSchedule(request, leaseId, scheduleId, 'generate'),
     detail,
     create: (request: Request, organizationId: string) =>
       write(request, organizationId),

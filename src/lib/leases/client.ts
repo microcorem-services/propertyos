@@ -43,7 +43,13 @@ export type LeaseSummary = {
 
 export type LeaseAuditEvent = {
   actor_id: string;
-  event_type: 'created' | 'updated';
+  event_type:
+    | 'created'
+    | 'updated'
+    | 'rent_schedule_created'
+    | 'rent_schedule_updated'
+    | 'rent_schedule_activated'
+    | 'rent_schedule_generated';
   changed_fields: string[];
   occurred_at: string;
 };
@@ -80,6 +86,47 @@ export type LeaseFields = {
 };
 
 export type LeaseUpdateFields = Partial<LeaseFields>;
+
+export type RentScheduleStatus = 'draft' | 'active';
+export type RentScheduleFrequency = 'monthly' | 'quarterly' | 'annually';
+
+export type RentSchedule = {
+  id: string;
+  organization_id: string;
+  lease_id: string;
+  charge_category: 'base_rent';
+  amount_per_period: string;
+  currency: LeaseCurrency;
+  payment_frequency: RentScheduleFrequency;
+  start_date: string;
+  end_date: string;
+  due_day: number;
+  short_month_rule: 'clamp_to_month_end';
+  status: RentScheduleStatus;
+  manual_review_reasons: (
+    | 'commencement_not_on_due_date'
+    | 'end_not_on_period_boundary'
+  )[];
+  installments: {
+    id: string;
+    due_date: string;
+    amount: string;
+    currency: LeaseCurrency;
+    status: 'expected';
+  }[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type RentScheduleFields = {
+  amount_per_period: string;
+  payment_frequency: RentScheduleFrequency;
+  start_date: string;
+  end_date: string;
+  due_day: number;
+  short_month_rule: 'clamp_to_month_end';
+  status?: RentScheduleStatus;
+};
 
 export class LeaseRequestError extends Error {
   constructor(
@@ -206,5 +253,53 @@ export function updateLease(
     `/api/leases/${encodeURIComponent(leaseId)}?${organizationQuery(organizationId)}`,
     'PATCH',
     fields,
+  );
+}
+
+function rentSchedulePath(organizationId: string, leaseId: string): string {
+  assertUuid(organizationId);
+  assertUuid(leaseId);
+  return `/api/leases/${encodeURIComponent(leaseId)}/rent-schedules?${organizationQuery(organizationId)}`;
+}
+
+export function fetchRentSchedules(
+  organizationId: string,
+  leaseId: string,
+): Promise<RentSchedule[]> {
+  return requestJson(rentSchedulePath(organizationId, leaseId), 'GET');
+}
+
+export function createRentSchedule(
+  organizationId: string,
+  leaseId: string,
+  fields: RentScheduleFields,
+): Promise<RentSchedule> {
+  return requestJson(rentSchedulePath(organizationId, leaseId), 'POST', fields);
+}
+
+export function updateRentSchedule(
+  organizationId: string,
+  leaseId: string,
+  scheduleId: string,
+  fields: Partial<RentScheduleFields>,
+): Promise<RentSchedule> {
+  assertUuid(leaseId);
+  assertUuid(scheduleId);
+  return requestJson(
+    `/api/leases/${encodeURIComponent(leaseId)}/rent-schedules/${encodeURIComponent(scheduleId)}?${organizationQuery(organizationId)}`,
+    'PATCH',
+    fields,
+  );
+}
+
+export function generateRentSchedule(
+  organizationId: string,
+  leaseId: string,
+  scheduleId: string,
+): Promise<RentSchedule> {
+  assertUuid(scheduleId);
+  return requestJson(
+    `/api/leases/${encodeURIComponent(leaseId)}/rent-schedules/${encodeURIComponent(scheduleId)}/generate?${organizationQuery(organizationId)}`,
+    'POST',
   );
 }

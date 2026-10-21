@@ -67,6 +67,9 @@ function setupFetch(records: LeaseSummary[], canCreate = true) {
         offset,
       });
     }
+    if (/^\/api\/leases\/[^/]+\/rent-schedules$/.test(url.pathname)) {
+      return Response.json([]);
+    }
     if (url.pathname === '/api/portfolios') return Response.json([]);
     return Response.json({ error: 'not found' }, { status: 404 });
   };
@@ -409,6 +412,142 @@ test('stale Unit details remain visible and allow termination without resubmitti
     await screen.findByText('Lease changes saved.');
     assert.equal(updateBody?.status, 'terminated');
     assert.equal('units' in (updateBody ?? {}), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('rent schedule form validates exact decimal text, creates expected instalments, and refreshes audit', async () => {
+  const originalFetch = globalThis.fetch;
+  const leaseId = '00000000-0000-4000-8000-000000000801';
+  const lease: Lease = {
+    ...makeLease(1),
+    id: leaseId,
+    units: makeLease(1).units.map((unit) => ({
+      ...unit,
+      verified_status: 'active' as const,
+    })),
+    audit_events: [{
+      actor_id: '00000000-0000-4000-8000-000000000901',
+      event_type: 'created',
+      changed_fields: ['lease_reference'],
+      occurred_at: now,
+    }],
+  };
+  const schedule = {
+    id: '00000000-0000-4000-8000-000000000811',
+    organization_id: organizationId,
+    lease_id: leaseId,
+    charge_category: 'base_rent',
+    amount_per_period: '900719925474.10',
+    currency: 'GBP',
+    payment_frequency: 'monthly',
+    start_date: '2026-04-01',
+    end_date: '2031-03-31',
+    due_day: 31,
+    short_month_rule: 'clamp_to_month_end',
+    status: 'draft',
+    manual_review_reasons: ['commencement_not_on_due_date'],
+    installments: [{
+      id: '00000000-0000-4000-8000-000000000812',
+      due_date: '2026-04-30',
+      amount: '900719925474.10',
+      currency: 'GBP',
+      status: 'expected',
+    }],
+    created_at: now,
+    updated_at: now,
+  };
+  let submittedBody: Record<string, unknown> | undefined;
+  let scheduleCreated = false;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input), window.location.origin);
+    if (url.pathname === '/api/leases/permissions') {
+      return Response.json({ can_read: true, can_create: true, can_update: true });
+    }
+    if (url.pathname === `/api/leases/${leaseId}`) {
+      return Response.json({
+        ...lease,
+        audit_events: scheduleCreated
+          ? [
+              ...lease.audit_events,
+              {
+                actor_id: '00000000-0000-4000-8000-000000000902',
+                event_type: 'rent_schedule_created',
+                changed_fields: [`rent_schedule:${schedule.id}`, 'amount_per_period'],
+                occurred_at: now,
+              },
+            ]
+          : lease.audit_events,
+      });
+    }
+    if (url.pathname === `/api/leases/${leaseId}/rent-schedules`) {
+      if (init?.method === 'POST') {
+        submittedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        scheduleCreated = true;
+        return Response.json(schedule, { status: 201 });
+      }
+      return Response.json(scheduleCreated ? [schedule] : []);
+    }
+    return Response.json({ error: 'not found' }, { status: 404 });
+  };
+  window.history.replaceState({}, '', `/leases/${leaseId}?organizationId=${organizationId}`);
+  const user = userEvent.setup();
+  try {
+    render(<LeasePage mode="detail" leaseId={leaseId} />);
+    await screen.findByRole('heading', { name: 'Rent schedules' });
+    await user.click(screen.getByRole('button', { name: 'Create rent schedule' }));
+    await user.type(screen.getByLabelText(/Amount per instalment/), '0');
+    await user.click(screen.getByRole('button', { name: 'Create draft schedule' }));
+    assert.match((await screen.findByRole('alert')).textContent ?? '', /positive fixed amount/);
+
+    const amount = screen.getByLabelText(/Amount per instalment/);
+    await user.clear(amount);
+    await user.type(amount, '900719925474.10');
+    await user.selectOptions(screen.getByLabelText('Payment frequency'), 'monthly');
+    await user.selectOptions(screen.getByLabelText('Day of month payments are due'), '31');
+    await user.click(screen.getByRole('button', { name: 'Create draft schedule' }));
+
+    assert.equal(submittedBody?.amount_per_period, '900719925474.10');
+    assert.equal(submittedBody?.short_month_rule, 'clamp_to_month_end');
+    assert.ok(await screen.findByRole('table', { name: 'Expected rent instalments for this schedule' }));
+    assert.equal(screen.getAllByText('GBP 900719925474.10').length, 2);
+    assert.ok(await screen.findByText('Rent schedule created'));
+    assert.ok(screen.getByText(/No partial amount has been calculated/));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('rent schedule controls are hidden for read-only lease users', async () => {
+  const originalFetch = globalThis.fetch;
+  const leaseId = '00000000-0000-4000-8000-000000000801';
+  const lease: Lease = {
+    ...makeLease(1),
+    id: leaseId,
+    units: makeLease(1).units.map((unit) => ({
+      ...unit,
+      verified_status: 'active' as const,
+    })),
+    audit_events: [],
+  };
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input), window.location.origin);
+    if (url.pathname === '/api/leases/permissions') {
+      return Response.json({ can_read: true, can_create: false, can_update: false });
+    }
+    if (url.pathname === `/api/leases/${leaseId}`) return Response.json(lease);
+    if (url.pathname === `/api/leases/${leaseId}/rent-schedules`) {
+      return Response.json([]);
+    }
+    return Response.json({ error: 'not found' }, { status: 404 });
+  };
+  window.history.replaceState({}, '', `/leases/${leaseId}?organizationId=${organizationId}`);
+  try {
+    render(<LeasePage mode="detail" leaseId={leaseId} />);
+    await screen.findByRole('heading', { name: 'Rent schedules' });
+    assert.equal(screen.queryByRole('button', { name: 'Create rent schedule' }), null);
+    assert.equal(screen.queryByRole('button', { name: 'Edit lease' }), null);
   } finally {
     globalThis.fetch = originalFetch;
   }

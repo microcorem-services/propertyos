@@ -26,6 +26,10 @@ Tests use an in-memory SQLite database and mocked service boundaries; they do no
 - `GET /api/v1/organizations/{organization_id}/lease-permissions`
 - `GET /api/v1/organizations/{organization_id}/leases/{lease_id}`
 - `PATCH /api/v1/organizations/{organization_id}/leases/{lease_id}`
+- `GET /api/v1/organizations/{organization_id}/leases/{lease_id}/rent-schedules`
+- `POST /api/v1/organizations/{organization_id}/leases/{lease_id}/rent-schedules`
+- `PATCH /api/v1/organizations/{organization_id}/leases/{lease_id}/rent-schedules/{schedule_id}`
+- `POST /api/v1/organizations/{organization_id}/leases/{lease_id}/rent-schedules/{schedule_id}/generate`
 
 The organization identifier in the route is only a lookup scope. Every request requires the existing Organization & Access authorization decision. Active members may read; owners and admins may create or update. Lease lookups always include `organization_id`, so a lease in a different organization is returned as not found.
 
@@ -36,6 +40,10 @@ Each supplied Unit includes its Registry hierarchy identifiers. Before a create 
 The Registry also asks the authenticated Lease Management API before deactivating a Unit; it refuses deactivation while any draft or active lease references that Unit and fails closed if Lease Management is unavailable. The Registry currently has no Unit deletion API. A stale lease can still be terminated to release the reference. These checks and lease-side revalidation detect stale references, but they cannot prevent a concurrent lease creation and Unit deactivation race. Eliminating that race requires a cross-service reservation/retirement protocol with compensation and reconciliation; this milestone does not claim an atomic cross-service guarantee.
 
 Every successful create or update writes an audit event in the same PostgreSQL transaction as its lease, party, and Unit-reference changes. A failed transaction rolls back both domain changes and the audit event.
+
+Rent schedules use the Lease Management database and the existing lease read/update authorization decisions. A schedule stores a fixed decimal amount per instalment, inherits currency from its lease, and generates expected instalments for monthly, quarterly, or annual frequency. Due days unavailable in a month are clamped to that month's final calendar day. Installment generation is repeatable and protected by an organization/schedule/due-date unique constraint. Draft schedules can be edited; active schedules cannot be edited, and active schedules with the same lease and charge category cannot have overlapping date ranges. Schedule writes serialize on the owning Lease row.
+
+Schedules must remain within the recorded Lease term. Boundary periods that do not align with due dates are flagged for manual review; the service never calculates a prorated amount. Only the `base_rent` charge category is implemented. The service does not collect payments, reconcile accounts, infer legal obligations, or apply rent-review rules.
 
 ## Scope and tender evidence
 

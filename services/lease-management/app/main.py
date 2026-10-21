@@ -7,7 +7,16 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app import config, database
-from app.models import Lease, LeaseAuditEvent, LeaseParty, LeaseUnit
+from app.models import (
+    Lease,
+    LeaseAuditEvent,
+    LeaseParty,
+    LeaseUnit,
+    RentInstallment,
+    RentSchedule,
+    RentScheduleStatus,
+)
+from app.rent_schedules import generate_due_dates
 from app.schemas import (
     LeaseAuditEventResponse,
     LeaseCreateRequest,
@@ -19,6 +28,10 @@ from app.schemas import (
     LeaseUnitInput,
     LeaseUnitResponse,
     LeaseUpdateRequest,
+    RentInstallmentResponse,
+    RentScheduleCreateRequest,
+    RentScheduleResponse,
+    RentScheduleUpdateRequest,
 )
 from app.security import (
     AuthorizedOrganization,
@@ -259,6 +272,148 @@ def _summary_response(lease: Lease) -> LeaseSummaryResponse:
     )
 
 
+def _rent_schedule_response(
+    schedule: RentSchedule, currency: str
+) -> RentScheduleResponse:
+    return RentScheduleResponse(
+        id=schedule.id,
+        organization_id=schedule.organization_id,
+        lease_id=schedule.lease_id,
+        charge_category=schedule.charge_category,
+        amount_per_period=f"{Decimal(schedule.amount_per_period):.2f}",
+        currency=currency,
+        payment_frequency=schedule.payment_frequency,
+        start_date=schedule.start_date,
+        end_date=schedule.end_date,
+        due_day=schedule.due_day,
+        short_month_rule=schedule.short_month_rule,
+        status=schedule.status,
+        manual_review_reasons=schedule.manual_review_reasons,
+        installments=[
+            RentInstallmentResponse(
+                id=installment.id,
+                due_date=installment.due_date,
+                amount=f"{Decimal(installment.amount):.2f}",
+                currency=installment.currency,
+                status=installment.status,
+            )
+            for installment in sorted(
+                schedule.installments, key=lambda item: item.due_date
+            )
+        ],
+        created_at=schedule.created_at,
+        updated_at=schedule.updated_at,
+    )
+
+
+def _lease_for_schedule(
+    session: Session, organization_id: UUID, lease_id: UUID
+) -> Lease:
+    try:
+        lease = session.scalar(
+            select(Lease)
+            .where(Lease.id == lease_id, Lease.organization_id == organization_id)
+            .with_for_update()
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if lease is None:
+        raise HTTPException(status_code=404, detail="Lease not found")
+    return lease
+
+
+def _validate_schedule_term(lease: Lease, start_date, end_date) -> None:
+    if (
+        lease.status in ("expired", "terminated")
+        or start_date < lease.start_date
+        or end_date > lease.expiry_date
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Rent schedule dates must fall within the current lease term",
+        )
+
+
+def _ensure_schedule_installments(
+    session: Session, schedule: RentSchedule, lease: Lease
+) -> int:
+    try:
+        due_dates, review_reasons = generate_due_dates(
+            schedule.start_date,
+            schedule.end_date,
+            schedule.due_day,
+            schedule.payment_frequency,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    schedule.manual_review_reasons = review_reasons
+    existing_dates = set(
+        session.scalars(
+            select(RentInstallment.due_date).where(
+                RentInstallment.organization_id == schedule.organization_id,
+                RentInstallment.schedule_id == schedule.id,
+            )
+        )
+    )
+    missing = [due_date for due_date in due_dates if due_date not in existing_dates]
+    schedule.installments.extend(
+        RentInstallment(
+            organization_id=schedule.organization_id,
+            due_date=due_date,
+            amount=schedule.amount_per_period,
+            currency=lease.currency,
+            status="expected",
+        )
+        for due_date in missing
+    )
+    return len(missing)
+
+
+def _add_schedule_audit(
+    lease: Lease,
+    organization_id: UUID,
+    actor_id: UUID,
+    schedule: RentSchedule,
+    event_type: str,
+    changed_fields: list[str],
+) -> None:
+    lease.updated_at = func.now()
+    lease.audit_events.append(
+        LeaseAuditEvent(
+            organization_id=organization_id,
+            lease_id=lease.id,
+            actor_id=actor_id,
+            event_type=event_type,
+            changed_fields=[
+                f"rent_schedule:{schedule.id}",
+                *changed_fields,
+            ],
+        )
+    )
+
+
+def _active_schedule_conflict(
+    session: Session,
+    schedule: RentSchedule,
+    *,
+    exclude_schedule_id: UUID | None = None,
+) -> bool:
+    query = select(RentSchedule.id).where(
+        RentSchedule.organization_id == schedule.organization_id,
+        RentSchedule.lease_id == schedule.lease_id,
+        RentSchedule.charge_category == schedule.charge_category,
+        RentSchedule.status == RentScheduleStatus.ACTIVE.value,
+        RentSchedule.start_date <= schedule.end_date,
+        RentSchedule.end_date >= schedule.start_date,
+    )
+    if exclude_schedule_id is not None:
+        query = query.where(RentSchedule.id != exclude_schedule_id)
+    try:
+        return session.scalar(query.limit(1)) is not None
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+
+
 @app.get(
     f"{API_V1_PREFIX}/organizations/{{organization_id}}/lease-permissions",
 )
@@ -287,6 +442,275 @@ def get_lease_permissions(
         "can_create": allowed("lease-management.leases.create"),
         "can_update": allowed("lease-management.leases.update"),
     }
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases/{{lease_id}}/rent-schedules",
+    response_model=list[RentScheduleResponse],
+)
+def list_rent_schedules(
+    organization_id: UUID,
+    lease_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> list[RentScheduleResponse]:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        lease = session.scalar(
+            select(Lease).where(
+                Lease.id == lease_id, Lease.organization_id == organization_id
+            )
+        )
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Lease not found")
+        schedules = list(
+            session.scalars(
+                select(RentSchedule)
+                .options(selectinload(RentSchedule.installments))
+                .where(
+                    RentSchedule.organization_id == organization_id,
+                    RentSchedule.lease_id == lease_id,
+                )
+                .order_by(RentSchedule.start_date, RentSchedule.id)
+            )
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    return [_rent_schedule_response(schedule, lease.currency) for schedule in schedules]
+
+
+@app.post(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases/{{lease_id}}/rent-schedules",
+    response_model=RentScheduleResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_rent_schedule(
+    organization_id: UUID,
+    lease_id: UUID,
+    payload: RentScheduleCreateRequest,
+    authorization: AuthorizedOrganization = Depends(get_update_authorization),
+    session: Session = Depends(_database_session),
+) -> RentScheduleResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    lease = _lease_for_schedule(session, organization_id, lease_id)
+    _validate_schedule_term(lease, payload.start_date, payload.end_date)
+    if payload.status == RentScheduleStatus.ACTIVE.value:
+        if lease.status != "active":
+            raise HTTPException(
+                status_code=422,
+                detail="Only an active lease can have an active rent schedule",
+            )
+    schedule = RentSchedule(
+        organization_id=organization_id,
+        lease_id=lease.id,
+        charge_category=payload.charge_category,
+        amount_per_period=payload.amount_per_period,
+        payment_frequency=payload.payment_frequency,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        due_day=payload.due_day,
+        short_month_rule=payload.short_month_rule,
+        status=payload.status,
+        manual_review_reasons=[],
+    )
+    if schedule.status == RentScheduleStatus.ACTIVE.value and _active_schedule_conflict(
+        session, schedule
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="An active rent schedule already overlaps this date range",
+        )
+    try:
+        session.add(schedule)
+        session.flush()
+        _ensure_schedule_installments(session, schedule, lease)
+        _add_schedule_audit(
+            lease,
+            organization_id,
+            authorization.actor_id,
+            schedule,
+            "rent_schedule_created",
+            [
+                "amount_per_period",
+                "payment_frequency",
+                "start_date",
+                "end_date",
+                "due_day",
+                "short_month_rule",
+                "status",
+                "installments",
+            ],
+        )
+        session.commit()
+        return _rent_schedule_response(schedule, lease.currency)
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409, detail="Rent schedule conflicts with existing data"
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.patch(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases/{{lease_id}}/rent-schedules/{{schedule_id}}",
+    response_model=RentScheduleResponse,
+)
+def update_rent_schedule(
+    organization_id: UUID,
+    lease_id: UUID,
+    schedule_id: UUID,
+    payload: RentScheduleUpdateRequest,
+    authorization: AuthorizedOrganization = Depends(get_update_authorization),
+    session: Session = Depends(_database_session),
+) -> RentScheduleResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    lease = _lease_for_schedule(session, organization_id, lease_id)
+    try:
+        schedule = session.scalar(
+            select(RentSchedule)
+            .options(selectinload(RentSchedule.installments))
+            .where(
+                RentSchedule.id == schedule_id,
+                RentSchedule.lease_id == lease_id,
+                RentSchedule.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Rent schedule not found")
+    updates = {field: getattr(payload, field) for field in payload.model_fields_set}
+    if schedule.status == RentScheduleStatus.ACTIVE.value:
+        if set(updates) == {"status"} and updates["status"] == schedule.status:
+            return _rent_schedule_response(schedule, lease.currency)
+        raise HTTPException(
+            status_code=409,
+            detail="Active rent schedules cannot be edited or deactivated",
+        )
+
+    merged_start = updates.get("start_date", schedule.start_date)
+    merged_end = updates.get("end_date", schedule.end_date)
+    _validate_schedule_term(lease, merged_start, merged_end)
+    next_status = updates.get("status", schedule.status)
+    if next_status == RentScheduleStatus.ACTIVE.value:
+        if lease.status != "active":
+            raise HTTPException(
+                status_code=422,
+                detail="Only an active lease can have an active rent schedule",
+            )
+        candidate = RentSchedule(
+            organization_id=organization_id,
+            lease_id=lease.id,
+            charge_category=schedule.charge_category,
+            amount_per_period=updates.get(
+                "amount_per_period", schedule.amount_per_period
+            ),
+            payment_frequency=updates.get(
+                "payment_frequency", schedule.payment_frequency
+            ),
+            start_date=merged_start,
+            end_date=merged_end,
+            due_day=updates.get("due_day", schedule.due_day),
+            short_month_rule=updates.get("short_month_rule", schedule.short_month_rule),
+            status=next_status,
+            manual_review_reasons=[],
+        )
+        if _active_schedule_conflict(
+            session, candidate, exclude_schedule_id=schedule.id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="An active rent schedule already overlaps this date range",
+            )
+    try:
+        for field, value in updates.items():
+            setattr(schedule, field, value)
+        schedule.installments.clear()
+        session.flush()
+        _ensure_schedule_installments(session, schedule, lease)
+        _add_schedule_audit(
+            lease,
+            organization_id,
+            authorization.actor_id,
+            schedule,
+            (
+                "rent_schedule_activated"
+                if next_status == RentScheduleStatus.ACTIVE.value
+                else "rent_schedule_updated"
+            ),
+            list(updates),
+        )
+        session.commit()
+        return _rent_schedule_response(schedule, lease.currency)
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409, detail="Rent schedule conflicts with existing data"
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.post(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases/{{lease_id}}/rent-schedules/{{schedule_id}}/generate",
+    response_model=RentScheduleResponse,
+)
+def generate_rent_schedule_installments(
+    organization_id: UUID,
+    lease_id: UUID,
+    schedule_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_update_authorization),
+    session: Session = Depends(_database_session),
+) -> RentScheduleResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    lease = _lease_for_schedule(session, organization_id, lease_id)
+    try:
+        schedule = session.scalar(
+            select(RentSchedule)
+            .options(selectinload(RentSchedule.installments))
+            .where(
+                RentSchedule.id == schedule_id,
+                RentSchedule.lease_id == lease_id,
+                RentSchedule.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Rent schedule not found")
+    old_review_reasons = list(schedule.manual_review_reasons)
+    try:
+        inserted = _ensure_schedule_installments(session, schedule, lease)
+        changed = inserted > 0 or old_review_reasons != schedule.manual_review_reasons
+        if changed:
+            _add_schedule_audit(
+                lease,
+                organization_id,
+                authorization.actor_id,
+                schedule,
+                "rent_schedule_generated",
+                ["installments"],
+            )
+            session.commit()
+        return _rent_schedule_response(schedule, lease.currency)
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Rent schedule generation conflicts with existing data",
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
 
 
 @app.get(
@@ -490,6 +914,7 @@ def update_lease(
                 selectinload(Lease.audit_events),
             )
             .where(Lease.id == lease_id, Lease.organization_id == organization_id)
+            .with_for_update()
         )
     except SQLAlchemyError:
         _raise_database_unavailable()
@@ -504,6 +929,44 @@ def update_lease(
         merged_break is not None and not merged_start <= merged_break <= merged_expiry
     ):
         raise HTTPException(status_code=422, detail="Lease dates are inconsistent")
+    if "start_date" in updates or "expiry_date" in updates:
+        try:
+            conflicting_schedule = session.scalar(
+                select(RentSchedule.id)
+                .where(
+                    RentSchedule.organization_id == organization_id,
+                    RentSchedule.lease_id == lease_id,
+                    (
+                        (RentSchedule.start_date < merged_start)
+                        | (RentSchedule.end_date > merged_expiry)
+                    ),
+                )
+                .limit(1)
+            )
+        except SQLAlchemyError:
+            _raise_database_unavailable()
+        if conflicting_schedule is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Lease dates cannot exclude an existing rent schedule",
+            )
+    if "currency" in updates and updates["currency"] != lease.currency:
+        try:
+            has_schedule = session.scalar(
+                select(RentSchedule.id)
+                .where(
+                    RentSchedule.organization_id == organization_id,
+                    RentSchedule.lease_id == lease_id,
+                )
+                .limit(1)
+            )
+        except SQLAlchemyError:
+            _raise_database_unavailable()
+        if has_schedule is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Lease currency cannot change while rent schedules exist",
+            )
     if "units" in updates:
         _verify_units(organization_id, updates["units"], user_token)
     elif updates.get("status") != "terminated":

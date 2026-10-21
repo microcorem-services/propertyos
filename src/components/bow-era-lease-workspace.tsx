@@ -36,6 +36,10 @@ import {
   fetchLeases,
   LeaseRequestError,
   updateLease,
+  createRentSchedule,
+  fetchRentSchedules,
+  generateRentSchedule,
+  updateRentSchedule,
   type Lease,
   type LeaseFields,
   type LeasePartyInput,
@@ -44,6 +48,9 @@ import {
   type LeaseSummary,
   type LeaseUnitReference,
   type LeaseUpdateFields,
+  type RentSchedule,
+  type RentScheduleFields,
+  type RentScheduleFrequency,
 } from '@/lib/leases/client';
 
 const PAGE_SIZE = 20;
@@ -707,7 +714,369 @@ function LeaseForm({
   );
 }
 
-function LeaseDetail({ lease, canUpdate, onEdit }: { lease: Lease; canUpdate: boolean; onEdit: () => void }) {
+type RentScheduleFormState = {
+  amount_per_period: string;
+  payment_frequency: RentScheduleFrequency;
+  start_date: string;
+  end_date: string;
+  due_day: number;
+};
+
+function RentScheduleForm({
+  lease,
+  schedule,
+  saving,
+  onCancel,
+  onSaved,
+}: {
+  lease: Lease;
+  schedule?: RentSchedule;
+  saving: boolean;
+  onCancel: () => void;
+  onSaved: (value: RentSchedule) => void;
+}) {
+  const [values, setValues] = useState<RentScheduleFormState>({
+    amount_per_period: schedule?.amount_per_period ?? '',
+    payment_frequency: schedule?.payment_frequency ?? 'monthly',
+    start_date: schedule?.start_date ?? lease.start_date,
+    end_date: schedule?.end_date ?? lease.expiry_date,
+    due_day: schedule?.due_day ?? 1,
+  });
+  const [error, setError] = useState('');
+
+  async function submit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setError('');
+    const amount = values.amount_per_period.trim();
+    if (
+      !/^\d{1,12}(?:\.\d{1,2})?$/.test(amount) ||
+      !/[1-9]/.test(amount.replace('.', ''))
+    ) {
+      setError('Enter a positive fixed amount with no more than two decimal places.');
+      return;
+    }
+    if (
+      !values.start_date ||
+      !values.end_date ||
+      values.end_date < values.start_date ||
+      values.start_date < lease.start_date ||
+      values.end_date > lease.expiry_date
+    ) {
+      setError('Schedule dates must fall within the recorded lease term.');
+      return;
+    }
+    const fields: RentScheduleFields = {
+      amount_per_period: amount.includes('.') ? amount : `${amount}.00`,
+      payment_frequency: values.payment_frequency,
+      start_date: values.start_date,
+      end_date: values.end_date,
+      due_day: values.due_day,
+      short_month_rule: 'clamp_to_month_end',
+    };
+    try {
+      const result = schedule
+        ? await updateRentSchedule(
+            lease.organization_id,
+            lease.id,
+            schedule.id,
+            fields,
+          )
+        : await createRentSchedule(lease.organization_id, lease.id, fields);
+      onSaved(result);
+    } catch (reason) {
+      setError(leaseError(reason, 'The rent schedule could not be saved.').message);
+    }
+  }
+
+  return (
+    <form className="lease-form rent-schedule-form" onSubmit={(event) => void submit(event)}>
+      <fieldset disabled={saving}>
+        <legend>{schedule ? 'Edit draft rent schedule' : 'Create rent schedule'}</legend>
+        <p className="lease-field-note">
+          Amounts are fixed per scheduled instalment. No amount is prorated. A schedule boundary within a payment period is flagged for manual review.
+        </p>
+        <div className="lease-form-grid">
+          <label>
+            Amount per instalment ({lease.currency})
+            <input
+              required
+              inputMode="decimal"
+              aria-describedby="rent-schedule-amount-help"
+              value={values.amount_per_period}
+              onChange={(event) => setValues((current) => ({ ...current, amount_per_period: event.target.value }))}
+            />
+            <small id="rent-schedule-amount-help">Use a positive decimal amount with up to two decimal places.</small>
+          </label>
+          <label>
+            Payment frequency
+            <select
+              value={values.payment_frequency}
+              onChange={(event) => setValues((current) => ({ ...current, payment_frequency: event.target.value as RentScheduleFrequency }))}
+            >
+              <option value="monthly">Monthly</option>
+              <option value="quarterly">Quarterly</option>
+              <option value="annually">Annually</option>
+            </select>
+          </label>
+          <label>
+            Schedule commencement
+            <input
+              type="date"
+              required
+              value={values.start_date}
+              min={lease.start_date}
+              max={lease.expiry_date}
+              onChange={(event) => setValues((current) => ({ ...current, start_date: event.target.value }))}
+            />
+          </label>
+          <label>
+            Schedule end
+            <input
+              type="date"
+              required
+              value={values.end_date}
+              min={lease.start_date}
+              max={lease.expiry_date}
+              onChange={(event) => setValues((current) => ({ ...current, end_date: event.target.value }))}
+            />
+          </label>
+          <label>
+            Day of month payments are due
+            <select
+              value={values.due_day}
+              onChange={(event) => setValues((current) => ({ ...current, due_day: Number(event.target.value) }))}
+            >
+              {Array.from({ length: 31 }, (_, index) => index + 1).map((day) => (
+                <option key={day} value={day}>{day}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Short-month rule
+            <select value="clamp_to_month_end" disabled>
+              <option value="clamp_to_month_end">Use the month's final day when due day is unavailable</option>
+            </select>
+          </label>
+        </div>
+      </fieldset>
+      {error && <p className="lease-form-error" role="alert">{error}</p>}
+      <div className="lease-form-actions">
+        <button className="bow-era-button" type="submit" disabled={saving}>
+          {saving ? 'Saving…' : schedule ? 'Save draft schedule' : 'Create draft schedule'}
+        </button>
+        <button className="bow-era-button bow-era-button-secondary" type="button" onClick={onCancel} disabled={saving}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function RentSchedulesPanel({
+  organizationId,
+  lease,
+  canUpdate,
+  onLeaseUpdated,
+}: {
+  organizationId: string;
+  lease: Lease;
+  canUpdate: boolean;
+  onLeaseUpdated: (lease: Lease) => void;
+}) {
+  const [schedules, setSchedules] = useState<RentSchedule[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [editingSchedule, setEditingSchedule] = useState<RentSchedule | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      setSchedules(await fetchRentSchedules(organizationId, lease.id));
+    } catch (reason) {
+      setError(leaseError(reason, 'Rent schedules could not be loaded.').message);
+    } finally {
+      setLoading(false);
+    }
+  }, [lease.id, organizationId]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function finishMutation(): Promise<void> {
+    setSaving(true);
+    setError('');
+    try {
+      await refresh();
+      onLeaseUpdated(await fetchLease(organizationId, lease.id));
+    } catch (reason) {
+      setError(leaseError(reason, 'The rent schedule change could not be verified.').message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function activate(schedule: RentSchedule): Promise<void> {
+    setSaving(true);
+    setError('');
+    try {
+      await updateRentSchedule(organizationId, lease.id, schedule.id, { status: 'active' });
+      await finishMutation();
+    } catch (reason) {
+      setError(leaseError(reason, 'The rent schedule could not be activated.').message);
+      setSaving(false);
+    }
+  }
+
+  async function regenerate(schedule: RentSchedule): Promise<void> {
+    setSaving(true);
+    setError('');
+    try {
+      await generateRentSchedule(organizationId, lease.id, schedule.id);
+      await finishMutation();
+    } catch (reason) {
+      setError(leaseError(reason, 'Expected instalments could not be refreshed.').message);
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="lease-rent-schedules" aria-labelledby="rent-schedules-heading">
+      <div className="lease-section-heading">
+        <h3 id="rent-schedules-heading">Rent schedules</h3>
+        {canUpdate && lease.status !== 'expired' && lease.status !== 'terminated' && !creating && !editingSchedule && (
+          <button
+            className="bow-era-button bow-era-button-secondary"
+            type="button"
+            onClick={() => setCreating(true)}
+          >
+            Create rent schedule
+          </button>
+        )}
+      </div>
+      <p className="lease-field-note">
+        Expected instalments only; this is not payment collection. Currency follows the lease. Due days clamp to the final day of shorter months. Partial boundary periods are flagged and are not prorated.
+      </p>
+      {loading ? <p role="status">Loading rent schedules…</p> : null}
+      {error && <p className="lease-form-error" role="alert">{error}</p>}
+      {!loading && schedules.length === 0 && !creating && (
+        <p>No rent schedules are recorded for this lease.</p>
+      )}
+      {schedules.map((schedule) => (
+        <article className="lease-rent-schedule" key={schedule.id}>
+          <div className="lease-section-heading">
+            <h4>{schedule.charge_category.replaceAll('_', ' ')} · {schedule.status}</h4>
+            {canUpdate && schedule.status === 'draft' && !editingSchedule && !creating && (
+              <div className="lease-form-actions">
+                <button
+                  className="bow-era-button bow-era-button-secondary"
+                  type="button"
+                  disabled={saving}
+                  onClick={() => setEditingSchedule(schedule)}
+                >
+                  Edit draft
+                </button>
+                <button
+                  className="bow-era-button"
+                  type="button"
+                  disabled={saving}
+                  onClick={() => void activate(schedule)}
+                >
+                  {saving ? 'Saving…' : 'Activate schedule'}
+                </button>
+              </div>
+            )}
+            {canUpdate && schedule.status === 'active' && (
+              <button
+                className="bow-era-button bow-era-button-secondary"
+                type="button"
+                disabled={saving}
+                onClick={() => void regenerate(schedule)}
+              >
+                {saving ? 'Refreshing…' : 'Refresh expected instalments'}
+              </button>
+            )}
+          </div>
+          <dl className="lease-detail-grid rent-schedule-grid">
+            <div><dt>Amount per instalment</dt><dd>{schedule.currency} {schedule.amount_per_period}</dd></div>
+            <div><dt>Frequency</dt><dd>{schedule.payment_frequency}</dd></div>
+            <div><dt>Schedule dates</dt><dd>{formatDate(schedule.start_date)} – {formatDate(schedule.end_date)}</dd></div>
+            <div><dt>Due day</dt><dd>{schedule.due_day}; shorter months use their final day</dd></div>
+          </dl>
+          {schedule.manual_review_reasons.length > 0 && (
+            <p className="lease-form-error" role="note">
+              Manual review required for {schedule.manual_review_reasons.map((reason) =>
+                reason === 'commencement_not_on_due_date'
+                  ? 'the commencement boundary'
+                  : 'the end boundary',
+              ).join(' and ')}. No partial amount has been calculated.
+            </p>
+          )}
+          <div className="lease-table-wrap lease-installments-wrap">
+            <table className="lease-table lease-installments-table">
+              <caption>Expected rent instalments for this schedule</caption>
+              <thead>
+                <tr><th scope="col">Due date</th><th scope="col">Expected amount</th><th scope="col">Status</th></tr>
+              </thead>
+              <tbody>
+                {schedule.installments.map((installment) => (
+                  <tr key={installment.id}>
+                    <td>{formatDate(installment.due_date)}</td>
+                    <td>{installment.currency} {installment.amount}</td>
+                    <td>{installment.status}</td>
+                  </tr>
+                ))}
+                {schedule.installments.length === 0 && (
+                  <tr><td colSpan={3}>No instalments generated.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          {editingSchedule?.id === schedule.id && (
+            <RentScheduleForm
+              lease={lease}
+              schedule={schedule}
+              saving={saving}
+              onCancel={() => setEditingSchedule(null)}
+              onSaved={() => {
+                setEditingSchedule(null);
+                void finishMutation();
+              }}
+            />
+          )}
+        </article>
+      ))}
+      {creating && (
+        <RentScheduleForm
+          lease={lease}
+          saving={saving}
+          onCancel={() => setCreating(false)}
+          onSaved={() => {
+            setCreating(false);
+            void finishMutation();
+          }}
+        />
+      )}
+    </section>
+  );
+}
+
+function LeaseDetail({
+  organizationId,
+  lease,
+  canUpdate,
+  onEdit,
+  onLeaseUpdated,
+}: {
+  organizationId: string;
+  lease: Lease;
+  canUpdate: boolean;
+  onEdit: () => void;
+  onLeaseUpdated: (lease: Lease) => void;
+}) {
   const tenants = lease.parties.filter((party) => party.role === 'tenant');
   const landlords = lease.parties.filter((party) => party.role === 'landlord');
   const guarantors = lease.parties.filter((party) => party.role === 'guarantor');
@@ -744,13 +1113,31 @@ function LeaseDetail({ lease, canUpdate, onEdit }: { lease: Lease; canUpdate: bo
           ))}
         </ul>
       </section>
+      <RentSchedulesPanel
+        organizationId={organizationId}
+        lease={lease}
+        canUpdate={canUpdate}
+        onLeaseUpdated={onLeaseUpdated}
+      />
       <section aria-labelledby="lease-audit-heading">
         <h3 id="lease-audit-heading">Change history</h3>
         {lease.audit_events.length === 0 ? <p>No audit history is available.</p> : (
           <ol className="lease-audit-list">
             {lease.audit_events.map((event, index) => (
               <li key={`${event.occurred_at}-${index}`}>
-                <strong>{event.event_type === 'created' ? 'Lease recorded' : 'Lease updated'}</strong>
+                <strong>
+                  {event.event_type === 'created'
+                    ? 'Lease recorded'
+                    : event.event_type === 'updated'
+                      ? 'Lease updated'
+                      : event.event_type === 'rent_schedule_created'
+                        ? 'Rent schedule created'
+                        : event.event_type === 'rent_schedule_activated'
+                          ? 'Rent schedule activated'
+                          : event.event_type === 'rent_schedule_generated'
+                            ? 'Expected instalments generated'
+                            : 'Rent schedule updated'}
+                </strong>
                 <time dateTime={event.occurred_at}>{formatTimestamp(event.occurred_at)}</time>
                 {event.changed_fields.length > 0 && <span>Changed: {event.changed_fields.join(', ')}</span>}
               </li>
@@ -870,9 +1257,11 @@ export function LeaseWorkspace({ mode, leaseId }: { mode: 'new' | 'detail'; leas
         ) : lease && !editing ? (
           <>
             <LeaseDetail
+              organizationId={organizationId ?? ''}
               lease={lease}
               canUpdate={Boolean(permissions?.can_update || (mode === 'new' && permissions?.can_create))}
               onEdit={() => { setNotice(''); setEditing(true); }}
+              onLeaseUpdated={setLease}
             />
             {mode === 'new' && (
               <Link className="bow-era-button" href={leaseHref(lease.id, lease.organization_id)}>

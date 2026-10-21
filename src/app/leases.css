@@ -47,5 +47,16 @@
 .lease-form-error{padding:12px;background:#fff0ef;border-left:4px solid #a52d22;color:#76251e}
 .lease-success{padding:12px;background:#e5f4e9;color:#155d3c}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.lease-rent-schedules{display:grid;gap:16px;padding-top:20px;border-top:1px solid #d9e2e8}
+.lease-rent-schedules>h3{margin:0}
+.lease-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.lease-section-heading h3,.lease-section-heading h4{margin:0}
+.lease-rent-schedule{display:grid;gap:14px;padding:18px;border:1px solid #d9e2e8;border-radius:10px;background:#fbfdfe}
+.rent-schedule-grid{gap:8px 18px}
+.lease-installments-wrap{max-height:420px}
+.lease-installments-table{min-width:560px}
+.lease-installments-table caption{padding:12px;text-align:left;color:#294253;font-weight:700}
+.rent-schedule-form{padding:18px}
+@media(max-width:650px){.lease-section-heading{align-items:flex-start;flex-direction:column}.lease-rent-schedule{padding:14px}.rent-schedule-form{padding:12px}.lease-installments-table{min-width:500px}}
 @media(max-width:900px){.lease-unit-picker{grid-template-columns:repeat(2,minmax(0,1fr))}.lease-unit-picker button{justify-self:start}}
 @media(max-width:650px){.lease-main{padding-left:16px;padding-right:16px}.lease-toolbar{align-items:stretch;flex-direction:column}.lease-toolbar input{min-width:0;width:100%}.lease-create-button{margin-left:0;align-self:start}.lease-pagination{align-items:flex-start;flex-direction:column}.lease-detail,.lease-form{padding:16px}.lease-detail-grid,.lease-form-grid,.lease-unit-picker,.lease-party-row{grid-template-columns:1fr}.lease-detail-heading{align-items:flex-start;flex-direction:column}.lease-party-row{align-items:stretch}.lease-party-row .lease-remove-party{justify-self:start;margin:0}.lease-form-actions>*{flex:1}}

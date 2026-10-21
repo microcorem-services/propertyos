@@ -28,6 +28,11 @@ class LeaseStatus(StrEnum):
     TERMINATED = "terminated"
 
 
+class RentScheduleStatus(StrEnum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+
+
 class PartyRole(StrEnum):
     LANDLORD = "landlord"
     TENANT = "tenant"
@@ -166,7 +171,10 @@ class LeaseAuditEvent(Base):
             name="fk_lease_audit_lease_organization",
         ),
         CheckConstraint(
-            "event_type IN ('created', 'updated')", name="ck_lease_audit_event_type"
+            "event_type IN ('created', 'updated', 'rent_schedule_created', "
+            "'rent_schedule_updated', 'rent_schedule_activated', "
+            "'rent_schedule_generated')",
+            name="ck_lease_audit_event_type",
         ),
         Index(
             "ix_lease_audit_organization_lease_occurred",
@@ -182,9 +190,120 @@ class LeaseAuditEvent(Base):
     organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     lease_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
     changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     lease: Mapped[Lease] = relationship(back_populates="audit_events")
+
+
+class RentSchedule(Base):
+    __tablename__ = "rent_schedules"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["lease_id", "organization_id"],
+            ["leases.id", "leases.organization_id"],
+            name="fk_rent_schedules_lease_organization",
+        ),
+        UniqueConstraint(
+            "id", "organization_id", name="uq_rent_schedules_id_organization"
+        ),
+        CheckConstraint(
+            "charge_category = 'base_rent'", name="ck_rent_schedules_category"
+        ),
+        CheckConstraint(
+            "amount_per_period > 0", name="ck_rent_schedules_amount_positive"
+        ),
+        CheckConstraint(
+            "payment_frequency IN ('monthly', 'quarterly', 'annually')",
+            name="ck_rent_schedules_frequency",
+        ),
+        CheckConstraint("due_day BETWEEN 1 AND 31", name="ck_rent_schedules_due_day"),
+        CheckConstraint(
+            "short_month_rule = 'clamp_to_month_end'",
+            name="ck_rent_schedules_short_month_rule",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'active')", name="ck_rent_schedules_status"
+        ),
+        CheckConstraint("end_date >= start_date", name="ck_rent_schedules_dates"),
+        Index(
+            "ix_rent_schedules_organization_lease",
+            "organization_id",
+            "lease_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    lease_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    charge_category: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="base_rent"
+    )
+    amount_per_period: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    payment_frequency: Mapped[str] = mapped_column(String(20), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_day: Mapped[int] = mapped_column(nullable=False)
+    short_month_rule: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="clamp_to_month_end"
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=RentScheduleStatus.DRAFT.value
+    )
+    manual_review_reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    installments: Mapped[list["RentInstallment"]] = relationship(
+        back_populates="schedule", cascade="all, delete-orphan"
+    )
+
+
+class RentInstallment(Base):
+    __tablename__ = "rent_installments"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["schedule_id", "organization_id"],
+            ["rent_schedules.id", "rent_schedules.organization_id"],
+            name="fk_rent_installments_schedule_organization",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "schedule_id",
+            "due_date",
+            name="uq_rent_installments_schedule_due_date",
+        ),
+        CheckConstraint("amount > 0", name="ck_rent_installments_amount_positive"),
+        CheckConstraint(
+            "currency IN ('GBP', 'EUR', 'USD')",
+            name="ck_rent_installments_currency",
+        ),
+        CheckConstraint("status = 'expected'", name="ck_rent_installments_status"),
+        Index(
+            "ix_rent_installments_organization_due_date",
+            "organization_id",
+            "due_date",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    schedule_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="expected")
+    schedule: Mapped[RentSchedule] = relationship(back_populates="installments")

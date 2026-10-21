@@ -136,6 +136,70 @@ class LeaseUpdateRequest(APIModel):
         return self
 
 
+class RentScheduleCreateRequest(APIModel):
+    charge_category: Literal["base_rent"] = "base_rent"
+    amount_per_period: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    payment_frequency: Literal["monthly", "quarterly", "annually"]
+    start_date: date
+    end_date: date
+    due_day: int = Field(ge=1, le=31)
+    short_month_rule: Literal["clamp_to_month_end"] = "clamp_to_month_end"
+    status: Literal["draft", "active"] = "draft"
+
+    _amount_must_not_be_float = field_validator("amount_per_period", mode="before")(
+        reject_float_rent
+    )
+
+    @model_validator(mode="after")
+    def validate_schedule_dates(self):
+        if self.end_date < self.start_date:
+            raise ValueError("Schedule end date must not precede its start date.")
+        return self
+
+
+class RentScheduleUpdateRequest(APIModel):
+    amount_per_period: Decimal | None = Field(
+        default=None, gt=0, max_digits=14, decimal_places=2
+    )
+    payment_frequency: Literal["monthly", "quarterly", "annually"] | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    due_day: int | None = Field(default=None, ge=1, le=31)
+    short_month_rule: Literal["clamp_to_month_end"] | None = None
+    status: Literal["draft", "active"] | None = None
+
+    _amount_must_not_be_float = field_validator("amount_per_period", mode="before")(
+        reject_float_rent
+    )
+
+    @field_validator(
+        "amount_per_period",
+        "payment_frequency",
+        "start_date",
+        "end_date",
+        "due_day",
+        "short_month_rule",
+        "status",
+    )
+    @classmethod
+    def reject_null_for_non_nullable_fields(cls, value):
+        if value is None:
+            raise ValueError("This field cannot be null.")
+        return value
+
+    @model_validator(mode="after")
+    def require_fields_and_validate_dates(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one field must be updated.")
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.end_date < self.start_date
+        ):
+            raise ValueError("Schedule end date must not precede its start date.")
+        return self
+
+
 class LeasePartyResponse(BaseModel):
     id: UUID
     legal_name: str
@@ -153,9 +217,45 @@ class LeaseUnitResponse(BaseModel):
 
 class LeaseAuditEventResponse(BaseModel):
     actor_id: UUID
-    event_type: Literal["created", "updated"]
+    event_type: Literal[
+        "created",
+        "updated",
+        "rent_schedule_created",
+        "rent_schedule_updated",
+        "rent_schedule_activated",
+        "rent_schedule_generated",
+    ]
     changed_fields: list[str]
     occurred_at: datetime
+
+
+class RentInstallmentResponse(BaseModel):
+    id: UUID
+    due_date: date
+    amount: str
+    currency: Literal["GBP", "EUR", "USD"]
+    status: Literal["expected"]
+
+
+class RentScheduleResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    lease_id: UUID
+    charge_category: Literal["base_rent"]
+    amount_per_period: str
+    currency: Literal["GBP", "EUR", "USD"]
+    payment_frequency: Literal["monthly", "quarterly", "annually"]
+    start_date: date
+    end_date: date
+    due_day: int
+    short_month_rule: Literal["clamp_to_month_end"]
+    status: Literal["draft", "active"]
+    manual_review_reasons: list[
+        Literal["commencement_not_on_due_date", "end_not_on_period_boundary"]
+    ]
+    installments: list[RentInstallmentResponse]
+    created_at: datetime
+    updated_at: datetime
 
 
 class LeaseSummaryUnitResponse(BaseModel):

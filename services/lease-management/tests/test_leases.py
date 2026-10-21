@@ -1,9 +1,17 @@
+from datetime import date
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from app.models import Lease, LeaseAuditEvent, LeaseParty, LeaseUnit
+from app.models import (
+    Lease,
+    LeaseAuditEvent,
+    LeaseParty,
+    LeaseUnit,
+    RentInstallment,
+    RentSchedule,
+)
 from app.security import AuthorizedOrganization, UnitReferenceInvalid, get_user_token
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app import main
@@ -61,6 +69,35 @@ def lease_payload(unit_count=1):
             },
         ],
     }
+
+
+def rent_schedule_payload(**overrides):
+    return {
+        "charge_category": "base_rent",
+        "amount_per_period": "12500.50",
+        "payment_frequency": "monthly",
+        "start_date": "2026-04-01",
+        "end_date": "2026-06-29",
+        "due_day": 31,
+        "short_month_rule": "clamp_to_month_end",
+        "status": "draft",
+        **overrides,
+    }
+
+
+def create_test_lease(client, organization_id, registry_ok):
+    authorize(client, organization_id)
+    response = client.post(
+        f"/api/v1/organizations/{organization_id}/leases",
+        json=lease_payload(),
+        headers={"Authorization": "header.payload.signature"},
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+def rent_schedule_url(organization_id, lease_id):
+    return f"/api/v1/organizations/{organization_id}/leases/{lease_id}/rent-schedules"
 
 
 def test_create_lease_persists_decimal_units_joint_tenants_and_audit(
@@ -217,6 +254,311 @@ def test_lease_permissions_use_authorization_decisions(client, monkeypatch):
         "lease-management.leases.create",
         "lease-management.leases.update",
     ]
+
+
+def test_monthly_rent_schedule_clamps_short_months_and_keeps_decimal_amount(
+    client, db_factory, registry_ok
+):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    response = client.post(
+        url,
+        json=rent_schedule_payload(),
+        headers={"Authorization": "header.payload.signature"},
+    )
+
+    assert response.status_code == 201
+    schedule = response.json()
+    assert schedule["amount_per_period"] == "12500.50"
+    assert schedule["currency"] == "GBP"
+    assert schedule["manual_review_reasons"] == ["commencement_not_on_due_date"]
+    assert [item["due_date"] for item in schedule["installments"]] == [
+        "2026-04-30",
+        "2026-05-31",
+    ]
+    assert [item["amount"] for item in schedule["installments"]] == [
+        "12500.50",
+        "12500.50",
+    ]
+    assert all(item["status"] == "expected" for item in schedule["installments"])
+    with db_factory() as session:
+        stored = session.scalar(
+            select(RentSchedule).where(RentSchedule.id == UUID(schedule["id"]))
+        )
+        assert stored.amount_per_period == Decimal("12500.50")
+        assert session.scalar(
+            select(LeaseAuditEvent).where(
+                LeaseAuditEvent.lease_id == UUID(lease["id"]),
+                LeaseAuditEvent.event_type == "rent_schedule_created",
+            )
+        )
+
+
+def test_quarterly_and_annual_schedule_dates_follow_anchor_and_frequency(
+    client, registry_ok
+):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    headers = {"Authorization": "header.payload.signature"}
+
+    quarterly = client.post(
+        url,
+        json=rent_schedule_payload(
+            payment_frequency="quarterly",
+            start_date="2026-04-15",
+            end_date="2027-04-14",
+            due_day=15,
+        ),
+        headers=headers,
+    )
+    assert quarterly.status_code == 201
+    assert [item["due_date"] for item in quarterly.json()["installments"]] == [
+        "2026-04-15",
+        "2026-07-15",
+        "2026-10-15",
+        "2027-01-15",
+    ]
+    assert quarterly.json()["manual_review_reasons"] == []
+
+    annual = client.post(
+        url,
+        json=rent_schedule_payload(
+            payment_frequency="annually",
+            start_date="2026-04-01",
+            end_date="2030-03-31",
+            due_day=1,
+        ),
+        headers=headers,
+    )
+    assert annual.status_code == 201
+    assert [item["due_date"] for item in annual.json()["installments"]] == [
+        "2026-04-01",
+        "2027-04-01",
+        "2028-04-01",
+        "2029-04-01",
+    ]
+
+
+def test_rent_schedule_rejects_invalid_money_and_dates(client, registry_ok):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    headers = {"Authorization": "header.payload.signature"}
+
+    for override in (
+        {"amount_per_period": "0"},
+        {"amount_per_period": "1.234"},
+        {"amount_per_period": 1.25},
+        {"start_date": "2026-03-31"},
+        {"end_date": "2031-04-01"},
+        {"end_date": "2026-03-31"},
+        {"due_day": 32},
+    ):
+        response = client.post(
+            url,
+            json=rent_schedule_payload(**override),
+            headers=headers,
+        )
+        assert response.status_code == 422, override
+
+
+def test_active_rent_schedules_may_not_overlap_and_drafts_may_be_corrected(
+    client, registry_ok
+):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    headers = {"Authorization": "header.payload.signature"}
+    active_one = client.post(
+        url,
+        json=rent_schedule_payload(
+            start_date="2026-04-01",
+            end_date="2026-06-30",
+            due_day=1,
+            status="active",
+        ),
+        headers=headers,
+    )
+    assert active_one.status_code == 201
+    active_two = client.post(
+        url,
+        json=rent_schedule_payload(
+            start_date="2026-06-01",
+            end_date="2026-08-31",
+            due_day=1,
+            status="active",
+        ),
+        headers=headers,
+    )
+    assert active_two.status_code == 409
+    adjacent = client.post(
+        url,
+        json=rent_schedule_payload(
+            start_date="2026-07-01",
+            end_date="2026-09-30",
+            due_day=1,
+            status="active",
+        ),
+        headers=headers,
+    )
+    assert adjacent.status_code == 201
+
+    draft = client.post(
+        url,
+        json=rent_schedule_payload(),
+        headers=headers,
+    )
+    assert draft.status_code == 201
+    edited = client.patch(
+        f"{url}/{draft.json()['id']}",
+        json={"amount_per_period": "13000.75"},
+        headers=headers,
+    )
+    assert edited.status_code == 200
+    assert edited.json()["amount_per_period"] == "13000.75"
+    conflict_on_activation = client.patch(
+        f"{url}/{draft.json()['id']}",
+        json={"status": "active"},
+        headers=headers,
+    )
+    assert conflict_on_activation.status_code == 409
+
+    non_overlapping_draft = client.post(
+        url,
+        json=rent_schedule_payload(
+            start_date="2026-10-01",
+            end_date="2026-12-31",
+            due_day=1,
+        ),
+        headers=headers,
+    )
+    assert non_overlapping_draft.status_code == 201
+    activated = client.patch(
+        f"{url}/{non_overlapping_draft.json()['id']}",
+        json={"status": "active"},
+        headers=headers,
+    )
+    assert activated.status_code == 200
+    assert activated.json()["status"] == "active"
+    assert edited.json()["installments"][0]["amount"] == "13000.75"
+    lease_audit = client.get(
+        f"/api/v1/organizations/{organization_id}/leases/{lease['id']}",
+        headers=headers,
+    ).json()["audit_events"]
+    assert any(event["event_type"] == "rent_schedule_updated" for event in lease_audit)
+    assert any(
+        event["event_type"] == "rent_schedule_activated" for event in lease_audit
+    )
+
+    shortened_lease = client.patch(
+        f"/api/v1/organizations/{organization_id}/leases/{lease['id']}",
+        json={"expiry_date": "2026-08-31", "break_date": "2026-08-31"},
+        headers=headers,
+    )
+    assert shortened_lease.status_code == 409
+    currency_change = client.patch(
+        f"/api/v1/organizations/{organization_id}/leases/{lease['id']}",
+        json={"currency": "EUR"},
+        headers=headers,
+    )
+    assert currency_change.status_code == 409
+
+
+def test_schedule_generation_is_idempotent_and_audits_added_installments(
+    client, db_factory, registry_ok
+):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    headers = {"Authorization": "header.payload.signature"}
+    created = client.post(url, json=rent_schedule_payload(), headers=headers)
+    assert created.status_code == 201
+    schedule_id = UUID(created.json()["id"])
+    generation_url = f"{url}/{schedule_id}/generate"
+
+    with db_factory() as session:
+        first = session.scalar(
+            select(RentInstallment).where(RentInstallment.schedule_id == schedule_id)
+        )
+        session.delete(first)
+        session.commit()
+
+    regenerated = client.post(generation_url, headers=headers)
+    assert regenerated.status_code == 200
+    assert len(regenerated.json()["installments"]) == 2
+    audit_after_repair = client.get(
+        f"/api/v1/organizations/{organization_id}/leases/{lease['id']}",
+        headers=headers,
+    ).json()["audit_events"]
+    generated_count = sum(
+        event["event_type"] == "rent_schedule_generated" for event in audit_after_repair
+    )
+    repeated = client.post(generation_url, headers=headers)
+    assert repeated.status_code == 200
+    assert len(repeated.json()["installments"]) == 2
+    audit_after_repeat = client.get(
+        f"/api/v1/organizations/{organization_id}/leases/{lease['id']}",
+        headers=headers,
+    ).json()["audit_events"]
+    assert (
+        sum(
+            event["event_type"] == "rent_schedule_generated"
+            for event in audit_after_repeat
+        )
+        == generated_count
+        == 1
+    )
+    with db_factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(RentInstallment.id)).where(
+                    RentInstallment.schedule_id == schedule_id
+                )
+            )
+            == 2
+        )
+
+
+def test_schedule_organization_isolation_and_write_authorization(client, registry_ok):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    headers = {"Authorization": "header.payload.signature"}
+    payload = rent_schedule_payload()
+
+    authorize(client, uuid4())
+    assert client.get(url, headers=headers).status_code == 403
+    assert client.post(url, json=payload, headers=headers).status_code == 403
+
+    from fastapi import HTTPException
+
+    def deny_update():
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    client.app.dependency_overrides[main.get_update_authorization] = deny_update
+    denied = client.post(url, json=payload, headers=headers)
+    assert denied.status_code == 403
+
+
+def test_short_month_and_leap_year_schedule_date_calculation():
+    from app.rent_schedules import generate_due_dates
+
+    due_dates, reasons = generate_due_dates(
+        start_date=date(2024, 2, 29),
+        end_date=date(2028, 2, 29),
+        due_day=29,
+        payment_frequency="annually",
+    )
+    assert due_dates == [
+        date(2024, 2, 29),
+        date(2025, 2, 28),
+        date(2026, 2, 28),
+        date(2027, 2, 28),
+        date(2028, 2, 29),
+    ]
+    assert reasons == ["end_not_on_period_boundary"]
 
 
 def test_invalid_dates_precision_and_float_rent_are_rejected(client, registry_ok):
