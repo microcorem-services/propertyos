@@ -1,4 +1,6 @@
 from decimal import Decimal
+import hashlib
+import json
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -12,6 +14,8 @@ from app.models import (
     LeaseAuditEvent,
     LeaseParty,
     LeaseUnit,
+    PropertyExpense,
+    PropertyExpenseAuditEvent,
     RentInstallment,
     RentSchedule,
     RentScheduleStatus,
@@ -28,6 +32,9 @@ from app.schemas import (
     LeaseUnitInput,
     LeaseUnitResponse,
     LeaseUpdateRequest,
+    PropertyExpenseCreateRequest,
+    PropertyExpenseResponse,
+    PropertyExpenseUpdateRequest,
     RentInstallmentResponse,
     RentScheduleCreateRequest,
     RentScheduleResponse,
@@ -35,6 +42,8 @@ from app.schemas import (
 )
 from app.security import (
     AuthorizedOrganization,
+    PropertyAssetReference,
+    PropertyAssetReferenceInvalid,
     ServiceDependencyUnavailable,
     UnitReference,
     UnitReferenceInvalid,
@@ -44,6 +53,7 @@ from app.security import (
     get_update_authorization,
     get_user_token,
     validate_unit_reference,
+    validate_property_asset_reference,
 )
 
 API_V1_PREFIX = "/api/v1"
@@ -280,6 +290,7 @@ def _rent_schedule_response(
         organization_id=schedule.organization_id,
         lease_id=schedule.lease_id,
         charge_category=schedule.charge_category,
+        description=schedule.description,
         amount_per_period=f"{Decimal(schedule.amount_per_period):.2f}",
         currency=currency,
         payment_frequency=schedule.payment_frequency,
@@ -414,6 +425,68 @@ def _active_schedule_conflict(
         _raise_database_unavailable()
 
 
+def _property_expense_response(expense: PropertyExpense) -> PropertyExpenseResponse:
+    return PropertyExpenseResponse(
+        id=expense.id,
+        organization_id=expense.organization_id,
+        asset_level=expense.asset_level,
+        portfolio_id=expense.portfolio_id,
+        site_id=expense.site_id,
+        building_id=expense.building_id,
+        unit_id=expense.unit_id,
+        category=expense.category,
+        description=expense.description,
+        amount=f"{Decimal(expense.amount):.2f}",
+        currency=expense.currency,
+        expense_date=expense.expense_date,
+        recoverability=expense.recoverability,
+        manual_review_reasons=expense.manual_review_reasons,
+        audit_events=[
+            {
+                "actor_id": event.actor_id,
+                "event_type": event.event_type,
+                "changed_fields": event.changed_fields,
+                "occurred_at": event.occurred_at,
+            }
+            for event in sorted(expense.audit_events, key=lambda item: item.occurred_at)
+        ],
+        created_at=expense.created_at,
+        updated_at=expense.updated_at,
+    )
+
+
+def _verify_property_expense_asset(
+    organization_id: UUID,
+    payload: PropertyExpenseCreateRequest,
+    user_token: str,
+) -> None:
+    reference = PropertyAssetReference(
+        asset_level=payload.asset_level,
+        portfolio_id=payload.portfolio_id,
+        site_id=payload.site_id,
+        building_id=payload.building_id,
+        unit_id=payload.unit_id,
+    )
+    try:
+        validate_property_asset_reference(organization_id, reference, user_token)
+    except PropertyAssetReferenceInvalid:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="The referenced property asset is invalid or inactive",
+        ) from None
+    except ServiceDependencyUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Property Registry unavailable",
+        ) from None
+
+
+def _expense_request_fingerprint(payload: PropertyExpenseCreateRequest) -> str:
+    canonical = payload.model_dump(mode="json", exclude={"idempotency_key"})
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 @app.get(
     f"{API_V1_PREFIX}/organizations/{{organization_id}}/lease-permissions",
 )
@@ -442,6 +515,223 @@ def get_lease_permissions(
         "can_create": allowed("lease-management.leases.create"),
         "can_update": allowed("lease-management.leases.update"),
     }
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/property-expenses",
+    response_model=list[PropertyExpenseResponse],
+)
+def list_property_expenses(
+    organization_id: UUID,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+    asset_level: str | None = Query(default=None),
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> list[PropertyExpenseResponse]:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if asset_level is not None and asset_level not in {
+        "portfolio",
+        "site",
+        "building",
+        "unit",
+    }:
+        raise HTTPException(status_code=422, detail="Invalid asset level")
+    query = (
+        select(PropertyExpense)
+        .options(selectinload(PropertyExpense.audit_events))
+        .where(PropertyExpense.organization_id == organization_id)
+        .order_by(PropertyExpense.expense_date.desc(), PropertyExpense.id)
+        .limit(limit)
+        .offset(offset)
+    )
+    if asset_level is not None:
+        query = query.where(PropertyExpense.asset_level == asset_level)
+    try:
+        expenses = list(session.scalars(query))
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    return [_property_expense_response(expense) for expense in expenses]
+
+
+@app.post(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/property-expenses",
+    response_model=PropertyExpenseResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_property_expense(
+    organization_id: UUID,
+    payload: PropertyExpenseCreateRequest,
+    authorization: AuthorizedOrganization = Depends(get_create_authorization),
+    user_token: str = Depends(get_user_token),
+    session: Session = Depends(_database_session),
+) -> PropertyExpenseResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    fingerprint = _expense_request_fingerprint(payload)
+    try:
+        existing = session.scalar(
+            select(PropertyExpense)
+            .options(selectinload(PropertyExpense.audit_events))
+            .where(
+                PropertyExpense.organization_id == organization_id,
+                PropertyExpense.idempotency_key == payload.idempotency_key,
+            )
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency key was already used for different expense data",
+            )
+        return _property_expense_response(existing)
+
+    _verify_property_expense_asset(organization_id, payload, user_token)
+    review_reasons = (
+        ["allocation_not_configured", "recovery_terms_not_verified"]
+        if payload.recoverability == "recoverable"
+        else []
+    )
+    expense = PropertyExpense(
+        organization_id=organization_id,
+        idempotency_key=payload.idempotency_key,
+        request_fingerprint=fingerprint,
+        asset_level=payload.asset_level,
+        portfolio_id=payload.portfolio_id,
+        site_id=payload.site_id,
+        building_id=payload.building_id,
+        unit_id=payload.unit_id,
+        category=payload.category,
+        description=payload.description,
+        amount=payload.amount,
+        currency=payload.currency,
+        expense_date=payload.expense_date,
+        recoverability=payload.recoverability,
+        manual_review_reasons=review_reasons,
+    )
+    expense.audit_events.append(
+        PropertyExpenseAuditEvent(
+            organization_id=organization_id,
+            actor_id=authorization.actor_id,
+            event_type="created",
+            changed_fields=[
+                "asset",
+                "category",
+                "description",
+                "amount",
+                "currency",
+                "expense_date",
+                "recoverability",
+            ],
+        )
+    )
+    session.add(expense)
+    try:
+        session.commit()
+        return _property_expense_response(expense)
+    except IntegrityError:
+        session.rollback()
+        try:
+            existing = session.scalar(
+                select(PropertyExpense)
+                .options(selectinload(PropertyExpense.audit_events))
+                .where(
+                    PropertyExpense.organization_id == organization_id,
+                    PropertyExpense.idempotency_key == payload.idempotency_key,
+                )
+            )
+        except SQLAlchemyError:
+            _raise_database_unavailable()
+        if existing is not None and existing.request_fingerprint == fingerprint:
+            return _property_expense_response(existing)
+        raise HTTPException(
+            status_code=409, detail="Property expense conflicts with existing data"
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/property-expenses/{{expense_id}}",
+    response_model=PropertyExpenseResponse,
+)
+def get_property_expense(
+    organization_id: UUID,
+    expense_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> PropertyExpenseResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        expense = session.scalar(
+            select(PropertyExpense)
+            .options(selectinload(PropertyExpense.audit_events))
+            .where(
+                PropertyExpense.id == expense_id,
+                PropertyExpense.organization_id == organization_id,
+            )
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if expense is None:
+        raise HTTPException(status_code=404, detail="Property expense not found")
+    return _property_expense_response(expense)
+
+
+@app.patch(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/property-expenses/{{expense_id}}",
+    response_model=PropertyExpenseResponse,
+)
+def update_property_expense(
+    organization_id: UUID,
+    expense_id: UUID,
+    payload: PropertyExpenseUpdateRequest,
+    authorization: AuthorizedOrganization = Depends(get_update_authorization),
+    session: Session = Depends(_database_session),
+) -> PropertyExpenseResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        expense = session.scalar(
+            select(PropertyExpense)
+            .options(selectinload(PropertyExpense.audit_events))
+            .where(
+                PropertyExpense.id == expense_id,
+                PropertyExpense.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if expense is None:
+        raise HTTPException(status_code=404, detail="Property expense not found")
+    updates = {field: getattr(payload, field) for field in payload.model_fields_set}
+    try:
+        for field, value in updates.items():
+            setattr(expense, field, value)
+        expense.manual_review_reasons = (
+            ["allocation_not_configured", "recovery_terms_not_verified"]
+            if expense.recoverability == "recoverable"
+            else []
+        )
+        expense.audit_events.append(
+            PropertyExpenseAuditEvent(
+                organization_id=organization_id,
+                actor_id=authorization.actor_id,
+                event_type="updated",
+                changed_fields=list(updates),
+            )
+        )
+        session.commit()
+        return _property_expense_response(expense)
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
 
 
 @app.get(
@@ -506,6 +796,7 @@ def create_rent_schedule(
         organization_id=organization_id,
         lease_id=lease.id,
         charge_category=payload.charge_category,
+        description=payload.description,
         amount_per_period=payload.amount_per_period,
         payment_frequency=payload.payment_frequency,
         start_date=payload.start_date,
@@ -531,9 +822,15 @@ def create_rent_schedule(
             organization_id,
             authorization.actor_id,
             schedule,
-            "rent_schedule_created",
+            (
+                "rent_schedule_created"
+                if payload.charge_category == "base_rent"
+                else "charge_created"
+            ),
             [
                 "amount_per_period",
+                "charge_category",
+                "description",
                 "payment_frequency",
                 "start_date",
                 "end_date",
@@ -607,7 +904,8 @@ def update_rent_schedule(
         candidate = RentSchedule(
             organization_id=organization_id,
             lease_id=lease.id,
-            charge_category=schedule.charge_category,
+            charge_category=updates.get("charge_category", schedule.charge_category),
+            description=updates.get("description", schedule.description),
             amount_per_period=updates.get(
                 "amount_per_period", schedule.amount_per_period
             ),
@@ -640,9 +938,17 @@ def update_rent_schedule(
             authorization.actor_id,
             schedule,
             (
-                "rent_schedule_activated"
+                (
+                    "rent_schedule_activated"
+                    if schedule.charge_category == "base_rent"
+                    else "charge_activated"
+                )
                 if next_status == RentScheduleStatus.ACTIVE.value
-                else "rent_schedule_updated"
+                else (
+                    "rent_schedule_updated"
+                    if schedule.charge_category == "base_rent"
+                    else "charge_updated"
+                )
             ),
             list(updates),
         )
@@ -697,7 +1003,11 @@ def generate_rent_schedule_installments(
                 organization_id,
                 authorization.actor_id,
                 schedule,
-                "rent_schedule_generated",
+                (
+                    "rent_schedule_generated"
+                    if schedule.charge_category == "base_rent"
+                    else "charge_generated"
+                ),
                 ["installments"],
             )
             session.commit()

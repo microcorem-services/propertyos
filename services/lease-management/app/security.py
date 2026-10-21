@@ -34,7 +34,20 @@ class UnitReference:
     unit_id: UUID
 
 
+@dataclass(frozen=True)
+class PropertyAssetReference:
+    asset_level: str
+    portfolio_id: UUID
+    site_id: UUID | None = None
+    building_id: UUID | None = None
+    unit_id: UUID | None = None
+
+
 class UnitReferenceInvalid(Exception):
+    pass
+
+
+class PropertyAssetReferenceInvalid(Exception):
     pass
 
 
@@ -363,3 +376,117 @@ def validate_unit_reference(
     if not matches or unit_status != "active":
         raise UnitReferenceInvalid
     return unit_status
+
+
+def validate_property_asset_reference(
+    organization_id: UUID,
+    reference: PropertyAssetReference,
+    user_token: str,
+) -> str:
+    if reference.asset_level not in {"portfolio", "site", "building", "unit"}:
+        raise PropertyAssetReferenceInvalid
+    paths = [
+        (
+            "portfolio",
+            reference.portfolio_id,
+            None,
+            f"/api/v1/portfolios/{reference.portfolio_id}",
+        )
+    ]
+    if reference.asset_level in {"site", "building", "unit"}:
+        paths.append(
+            (
+                "site",
+                reference.site_id,
+                reference.portfolio_id,
+                f"/api/v1/portfolios/{reference.portfolio_id}/sites/{reference.site_id}",
+            )
+        )
+    if reference.asset_level in {"building", "unit"}:
+        paths.append(
+            (
+                "building",
+                reference.building_id,
+                reference.site_id,
+                f"/api/v1/portfolios/{reference.portfolio_id}/sites/{reference.site_id}"
+                f"/buildings/{reference.building_id}",
+            )
+        )
+    if reference.asset_level == "unit":
+        paths.append(
+            (
+                "unit",
+                reference.unit_id,
+                reference.building_id,
+                f"/api/v1/portfolios/{reference.portfolio_id}/sites/{reference.site_id}"
+                f"/buildings/{reference.building_id}/units/{reference.unit_id}",
+            )
+        )
+    try:
+        url = _service_url(
+            config.PROPERTY_ASSETS_REGISTRY_URL,
+            config.PROPERTY_ASSETS_ALLOW_INSECURE_LOCAL_HTTP,
+            "",
+        )
+        timeout = _timeouts(
+            config.PROPERTY_ASSETS_CONNECT_TIMEOUT_SECONDS,
+            config.PROPERTY_ASSETS_READ_TIMEOUT_SECONDS,
+        )
+        workload_token = get_workload_token()
+    except (httpx.HTTPError, ServiceDependencyUnavailable):
+        raise ServiceDependencyUnavailable from None
+    asset_status = ""
+    expected_parent_fields = {
+        "portfolio": None,
+        "site": "portfolio_id",
+        "building": "site_id",
+        "unit": "building_id",
+    }
+    for level, expected_id, expected_parent, path in paths:
+        try:
+            response = httpx.get(
+                f"{url.rstrip('/')}{path}",
+                params={"organization_id": str(organization_id)},
+                headers={
+                    "Authorization": f"Bearer {user_token}",
+                    "X-Service-Authorization": f"Bearer {workload_token}",
+                    "Accept": "application/json",
+                },
+                timeout=timeout,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError:
+            raise ServiceDependencyUnavailable from None
+        if response.status_code == 404:
+            raise PropertyAssetReferenceInvalid
+        if response.status_code == 401:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if response.status_code == 403:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+            )
+        if response.status_code != 200:
+            raise ServiceDependencyUnavailable
+        try:
+            record = response.json()
+            if not isinstance(record, dict):
+                raise ValueError
+            parent_field = expected_parent_fields[level]
+            matches = (
+                UUID(record["id"]) == expected_id
+                and UUID(record["organization_id"]) == organization_id
+                and (
+                    parent_field is None
+                    or UUID(record[parent_field]) == expected_parent
+                )
+            )
+            asset_status = record["status"]
+        except (json.JSONDecodeError, UnicodeError, ValueError, TypeError, KeyError):
+            raise ServiceDependencyUnavailable from None
+        if not matches or asset_status != "active":
+            raise PropertyAssetReferenceInvalid
+    return asset_status

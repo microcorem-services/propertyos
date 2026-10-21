@@ -49,7 +49,11 @@ export type LeaseAuditEvent = {
     | 'rent_schedule_created'
     | 'rent_schedule_updated'
     | 'rent_schedule_activated'
-    | 'rent_schedule_generated';
+    | 'rent_schedule_generated'
+    | 'charge_created'
+    | 'charge_updated'
+    | 'charge_activated'
+    | 'charge_generated';
   changed_fields: string[];
   occurred_at: string;
 };
@@ -89,12 +93,20 @@ export type LeaseUpdateFields = Partial<LeaseFields>;
 
 export type RentScheduleStatus = 'draft' | 'active';
 export type RentScheduleFrequency = 'monthly' | 'quarterly' | 'annually';
+export type LeaseChargeCategory =
+  | 'base_rent'
+  | 'service_charge'
+  | 'building_maintenance'
+  | 'insurance_contribution'
+  | 'shared_facilities'
+  | 'other_property_charge';
 
 export type RentSchedule = {
   id: string;
   organization_id: string;
   lease_id: string;
-  charge_category: 'base_rent';
+  charge_category: LeaseChargeCategory;
+  description: string;
   amount_per_period: string;
   currency: LeaseCurrency;
   payment_frequency: RentScheduleFrequency;
@@ -119,6 +131,8 @@ export type RentSchedule = {
 };
 
 export type RentScheduleFields = {
+  charge_category?: LeaseChargeCategory;
+  description?: string;
   amount_per_period: string;
   payment_frequency: RentScheduleFrequency;
   start_date: string;
@@ -127,6 +141,64 @@ export type RentScheduleFields = {
   short_month_rule: 'clamp_to_month_end';
   status?: RentScheduleStatus;
 };
+
+export type PropertyExpenseAssetLevel = 'portfolio' | 'site' | 'building' | 'unit';
+export type PropertyExpenseCategory =
+  | 'utilities'
+  | 'maintenance'
+  | 'insurance'
+  | 'repairs'
+  | 'cleaning'
+  | 'security'
+  | 'shared_facilities'
+  | 'other';
+
+export type PropertyExpense = {
+  id: string;
+  organization_id: string;
+  asset_level: PropertyExpenseAssetLevel;
+  portfolio_id: string;
+  site_id: string | null;
+  building_id: string | null;
+  unit_id: string | null;
+  category: PropertyExpenseCategory;
+  description: string;
+  amount: string;
+  currency: LeaseCurrency;
+  expense_date: string;
+  recoverability: 'recoverable' | 'non_recoverable';
+  manual_review_reasons: ('allocation_not_configured' | 'recovery_terms_not_verified')[];
+  audit_events: {
+    actor_id: string;
+    event_type: 'created' | 'updated';
+    changed_fields: string[];
+    occurred_at: string;
+  }[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type PropertyExpenseFields = {
+  idempotency_key: string;
+  asset_level: PropertyExpenseAssetLevel;
+  portfolio_id: string;
+  site_id?: string;
+  building_id?: string;
+  unit_id?: string;
+  category: PropertyExpenseCategory;
+  description: string;
+  amount: string;
+  currency: LeaseCurrency;
+  expense_date: string;
+  recoverability: 'recoverable' | 'non_recoverable';
+};
+
+export type PropertyExpenseUpdateFields = Partial<
+  Pick<
+    PropertyExpenseFields,
+    'category' | 'description' | 'amount' | 'currency' | 'expense_date' | 'recoverability'
+  >
+>;
 
 export class LeaseRequestError extends Error {
   constructor(
@@ -301,5 +373,35 @@ export function generateRentSchedule(
   return requestJson(
     `/api/leases/${encodeURIComponent(leaseId)}/rent-schedules/${encodeURIComponent(scheduleId)}/generate?${organizationQuery(organizationId)}`,
     'POST',
+  );
+}
+
+function propertyExpensesPath(organizationId: string): string {
+  return `/api/property-expenses?${organizationQuery(organizationId)}`;
+}
+
+export function fetchPropertyExpenses(
+  organizationId: string,
+): Promise<PropertyExpense[]> {
+  return requestJson(propertyExpensesPath(organizationId), 'GET');
+}
+
+export function createPropertyExpense(
+  organizationId: string,
+  fields: PropertyExpenseFields,
+): Promise<PropertyExpense> {
+  return requestJson(propertyExpensesPath(organizationId), 'POST', fields);
+}
+
+export function updatePropertyExpense(
+  organizationId: string,
+  expenseId: string,
+  fields: PropertyExpenseUpdateFields,
+): Promise<PropertyExpense> {
+  assertUuid(expenseId);
+  return requestJson(
+    `/api/property-expenses/${encodeURIComponent(expenseId)}?${organizationQuery(organizationId)}`,
+    'PATCH',
+    fields,
   );
 }

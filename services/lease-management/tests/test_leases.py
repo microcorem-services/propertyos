@@ -2,15 +2,23 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+import pytest
 from app.models import (
     Lease,
     LeaseAuditEvent,
     LeaseParty,
     LeaseUnit,
+    PropertyExpense,
+    PropertyExpenseAuditEvent,
     RentInstallment,
     RentSchedule,
 )
-from app.security import AuthorizedOrganization, UnitReferenceInvalid, get_user_token
+from app.security import (
+    AuthorizedOrganization,
+    PropertyAssetReferenceInvalid,
+    UnitReferenceInvalid,
+    get_user_token,
+)
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -81,6 +89,24 @@ def rent_schedule_payload(**overrides):
         "due_day": 31,
         "short_month_rule": "clamp_to_month_end",
         "status": "draft",
+        **overrides,
+    }
+
+
+def property_expense_payload(**overrides):
+    return {
+        "idempotency_key": str(uuid4()),
+        "asset_level": "unit",
+        "portfolio_id": str(uuid4()),
+        "site_id": str(uuid4()),
+        "building_id": str(uuid4()),
+        "unit_id": str(uuid4()),
+        "category": "maintenance",
+        "description": "Lift inspection",
+        "amount": "245.80",
+        "currency": "GBP",
+        "expense_date": "2026-10-20",
+        "recoverability": "recoverable",
         **overrides,
     }
 
@@ -339,6 +365,155 @@ def test_quarterly_and_annual_schedule_dates_follow_anchor_and_frequency(
         "2028-04-01",
         "2029-04-01",
     ]
+
+
+def test_service_charge_schedule_uses_shared_generation_and_audit(client, registry_ok):
+    organization_id = uuid4()
+    lease = create_test_lease(client, organization_id, registry_ok)
+    url = rent_schedule_url(organization_id, UUID(lease["id"]))
+    headers = {"Authorization": "header.payload.signature"}
+    created = client.post(
+        url,
+        json=rent_schedule_payload(
+            charge_category="service_charge",
+            description="Shared building services",
+            payment_frequency="quarterly",
+        ),
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["charge_category"] == "service_charge"
+    assert created.json()["description"] == "Shared building services"
+    updated = client.patch(
+        f"{url}/{created.json()['id']}",
+        json={"description": "Building services contribution"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["description"] == "Building services contribution"
+    audit = client.get(
+        f"/api/v1/organizations/{organization_id}/leases/{lease['id']}",
+        headers=headers,
+    ).json()["audit_events"]
+    assert any(event["event_type"] == "charge_created" for event in audit)
+    assert any(event["event_type"] == "charge_updated" for event in audit)
+
+
+def test_property_expense_create_idempotency_manual_review_and_update(
+    client, db_factory, monkeypatch
+):
+    organization_id = uuid4()
+    actor_id = authorize(client, organization_id)
+    from app import main
+
+    registry_calls = []
+
+    def valid_asset(org_id, reference, token):
+        assert org_id == organization_id
+        assert token == "header.payload.signature"
+        registry_calls.append(reference)
+        return "active"
+
+    monkeypatch.setattr(main, "validate_property_asset_reference", valid_asset)
+    url = f"/api/v1/organizations/{organization_id}/property-expenses"
+    payload = property_expense_payload()
+    headers = {"Authorization": "header.payload.signature"}
+
+    created = client.post(url, json=payload, headers=headers)
+    assert created.status_code == 201
+    expense = created.json()
+    assert expense["amount"] == "245.80"
+    assert expense["manual_review_reasons"] == [
+        "allocation_not_configured",
+        "recovery_terms_not_verified",
+    ]
+    assert len(expense["audit_events"]) == 1
+    assert expense["audit_events"][0]["actor_id"] == str(actor_id)
+
+    replay = client.post(url, json=payload, headers=headers)
+    assert replay.status_code == 201
+    assert replay.json()["id"] == expense["id"]
+    assert len(registry_calls) == 1
+    conflicting_replay = client.post(
+        url,
+        json={**payload, "amount": "245.81"},
+        headers=headers,
+    )
+    assert conflicting_replay.status_code == 409
+
+    updated = client.patch(
+        f"{url}/{expense['id']}",
+        json={"amount": "300.25", "recoverability": "non_recoverable"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["amount"] == "300.25"
+    assert updated.json()["manual_review_reasons"] == []
+    assert [event["event_type"] for event in updated.json()["audit_events"]] == [
+        "created",
+        "updated",
+    ]
+    with db_factory() as session:
+        stored = session.get(PropertyExpense, UUID(expense["id"]))
+        assert stored.amount == Decimal("300.25")
+        assert len(
+            list(
+                session.scalars(
+                    select(PropertyExpenseAuditEvent).where(
+                        PropertyExpenseAuditEvent.expense_id == stored.id
+                    )
+                )
+            )
+        ) == 2
+
+
+def test_property_expense_requires_organization_authorization_and_valid_asset(
+    client, monkeypatch
+):
+    organization_id = uuid4()
+    other_organization = uuid4()
+    authorize(client, organization_id, authorized_id=other_organization)
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "validate_property_asset_reference",
+        lambda *_args: pytest.fail("Registry must not be called before org authorization"),
+    )
+    url = f"/api/v1/organizations/{organization_id}/property-expenses"
+    denied = client.post(
+        url,
+        json=property_expense_payload(),
+        headers={"Authorization": "header.payload.signature"},
+    )
+    assert denied.status_code == 403
+
+    authorize(client, organization_id)
+    monkeypatch.setattr(
+        main,
+        "validate_property_asset_reference",
+        lambda *_args: (_ for _ in ()).throw(PropertyAssetReferenceInvalid()),
+    )
+    invalid_asset = client.post(
+        url,
+        json=property_expense_payload(),
+        headers={"Authorization": "header.payload.signature"},
+    )
+    assert invalid_asset.status_code == 422
+
+
+def test_property_expense_rejects_float_precision_and_malformed_hierarchy(client):
+    organization_id = uuid4()
+    authorize(client, organization_id)
+    url = f"/api/v1/organizations/{organization_id}/property-expenses"
+    headers = {"Authorization": "header.payload.signature"}
+    for payload in (
+        property_expense_payload(amount=245.8),
+        property_expense_payload(amount="245.801"),
+        property_expense_payload(site_id=None),
+    ):
+        response = client.post(url, json=payload, headers=headers)
+        assert response.status_code == 422
 
 
 def test_rent_schedule_rejects_invalid_money_and_dates(client, registry_ok):

@@ -137,7 +137,15 @@ class LeaseUpdateRequest(APIModel):
 
 
 class RentScheduleCreateRequest(APIModel):
-    charge_category: Literal["base_rent"] = "base_rent"
+    charge_category: Literal[
+        "base_rent",
+        "service_charge",
+        "building_maintenance",
+        "insurance_contribution",
+        "shared_facilities",
+        "other_property_charge",
+    ] = "base_rent"
+    description: str = Field(default="Base rent", min_length=1, max_length=250)
     amount_per_period: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
     payment_frequency: Literal["monthly", "quarterly", "annually"]
     start_date: date
@@ -158,6 +166,15 @@ class RentScheduleCreateRequest(APIModel):
 
 
 class RentScheduleUpdateRequest(APIModel):
+    charge_category: Literal[
+        "base_rent",
+        "service_charge",
+        "building_maintenance",
+        "insurance_contribution",
+        "shared_facilities",
+        "other_property_charge",
+    ] | None = None
+    description: str | None = Field(default=None, min_length=1, max_length=250)
     amount_per_period: Decimal | None = Field(
         default=None, gt=0, max_digits=14, decimal_places=2
     )
@@ -174,6 +191,8 @@ class RentScheduleUpdateRequest(APIModel):
 
     @field_validator(
         "amount_per_period",
+        "charge_category",
+        "description",
         "payment_frequency",
         "start_date",
         "end_date",
@@ -224,6 +243,10 @@ class LeaseAuditEventResponse(BaseModel):
         "rent_schedule_updated",
         "rent_schedule_activated",
         "rent_schedule_generated",
+        "charge_created",
+        "charge_updated",
+        "charge_activated",
+        "charge_generated",
     ]
     changed_fields: list[str]
     occurred_at: datetime
@@ -241,7 +264,15 @@ class RentScheduleResponse(BaseModel):
     id: UUID
     organization_id: UUID
     lease_id: UUID
-    charge_category: Literal["base_rent"]
+    charge_category: Literal[
+        "base_rent",
+        "service_charge",
+        "building_maintenance",
+        "insurance_contribution",
+        "shared_facilities",
+        "other_property_charge",
+    ]
+    description: str
     amount_per_period: str
     currency: Literal["GBP", "EUR", "USD"]
     payment_frequency: Literal["monthly", "quarterly", "annually"]
@@ -254,6 +285,133 @@ class RentScheduleResponse(BaseModel):
         Literal["commencement_not_on_due_date", "end_not_on_period_boundary"]
     ]
     installments: list[RentInstallmentResponse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class PropertyExpenseCreateRequest(APIModel):
+    idempotency_key: UUID
+    asset_level: Literal["portfolio", "site", "building", "unit"]
+    portfolio_id: UUID
+    site_id: UUID | None = None
+    building_id: UUID | None = None
+    unit_id: UUID | None = None
+    category: Literal[
+        "utilities",
+        "maintenance",
+        "insurance",
+        "repairs",
+        "cleaning",
+        "security",
+        "shared_facilities",
+        "other",
+    ]
+    description: str = Field(min_length=1, max_length=250)
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    currency: Literal["GBP", "EUR", "USD"]
+    expense_date: date
+    recoverability: Literal["recoverable", "non_recoverable"]
+
+    _amount_must_not_be_float = field_validator("amount", mode="before")(
+        reject_float_rent
+    )
+
+    @model_validator(mode="after")
+    def validate_asset_hierarchy(self):
+        expected = {
+            "portfolio": (False, False, False),
+            "site": (True, False, False),
+            "building": (True, True, False),
+            "unit": (True, True, True),
+        }[self.asset_level]
+        actual = (
+            self.site_id is not None,
+            self.building_id is not None,
+            self.unit_id is not None,
+        )
+        if actual != expected:
+            raise ValueError("Asset identifiers must match the selected asset level.")
+        return self
+
+
+class PropertyExpenseUpdateRequest(APIModel):
+    category: Literal[
+        "utilities",
+        "maintenance",
+        "insurance",
+        "repairs",
+        "cleaning",
+        "security",
+        "shared_facilities",
+        "other",
+    ] | None = None
+    description: str | None = Field(default=None, min_length=1, max_length=250)
+    amount: Decimal | None = Field(
+        default=None, gt=0, max_digits=14, decimal_places=2
+    )
+    currency: Literal["GBP", "EUR", "USD"] | None = None
+    expense_date: date | None = None
+    recoverability: Literal["recoverable", "non_recoverable"] | None = None
+
+    _amount_must_not_be_float = field_validator("amount", mode="before")(
+        reject_float_rent
+    )
+
+    @field_validator(
+        "category",
+        "description",
+        "amount",
+        "currency",
+        "expense_date",
+        "recoverability",
+    )
+    @classmethod
+    def reject_null_for_non_nullable_fields(cls, value):
+        if value is None:
+            raise ValueError("This field cannot be null.")
+        return value
+
+    @model_validator(mode="after")
+    def require_fields(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one field must be updated.")
+        return self
+
+
+class PropertyExpenseAuditEventResponse(BaseModel):
+    actor_id: UUID
+    event_type: Literal["created", "updated"]
+    changed_fields: list[str]
+    occurred_at: datetime
+
+
+class PropertyExpenseResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    asset_level: Literal["portfolio", "site", "building", "unit"]
+    portfolio_id: UUID
+    site_id: UUID | None
+    building_id: UUID | None
+    unit_id: UUID | None
+    category: Literal[
+        "utilities",
+        "maintenance",
+        "insurance",
+        "repairs",
+        "cleaning",
+        "security",
+        "shared_facilities",
+        "other",
+    ]
+    description: str
+    amount: str
+    currency: Literal["GBP", "EUR", "USD"]
+    expense_date: date
+    recoverability: Literal["recoverable", "non_recoverable"]
+    manual_review_reasons: list[
+        Literal["allocation_not_configured", "recovery_terms_not_verified"]
+    ]
+    audit_events: list[PropertyExpenseAuditEventResponse]
     created_at: datetime
     updated_at: datetime
 

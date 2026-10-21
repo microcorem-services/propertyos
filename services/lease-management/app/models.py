@@ -33,6 +33,31 @@ class RentScheduleStatus(StrEnum):
     ACTIVE = "active"
 
 
+class ChargeCategory(StrEnum):
+    BASE_RENT = "base_rent"
+    SERVICE_CHARGE = "service_charge"
+    BUILDING_MAINTENANCE = "building_maintenance"
+    INSURANCE_CONTRIBUTION = "insurance_contribution"
+    SHARED_FACILITIES = "shared_facilities"
+    OTHER_PROPERTY_CHARGE = "other_property_charge"
+
+
+class PropertyExpenseCategory(StrEnum):
+    UTILITIES = "utilities"
+    MAINTENANCE = "maintenance"
+    INSURANCE = "insurance"
+    REPAIRS = "repairs"
+    CLEANING = "cleaning"
+    SECURITY = "security"
+    SHARED_FACILITIES = "shared_facilities"
+    OTHER = "other"
+
+
+class ExpenseRecoverability(StrEnum):
+    RECOVERABLE = "recoverable"
+    NON_RECOVERABLE = "non_recoverable"
+
+
 class PartyRole(StrEnum):
     LANDLORD = "landlord"
     TENANT = "tenant"
@@ -173,7 +198,8 @@ class LeaseAuditEvent(Base):
         CheckConstraint(
             "event_type IN ('created', 'updated', 'rent_schedule_created', "
             "'rent_schedule_updated', 'rent_schedule_activated', "
-            "'rent_schedule_generated')",
+            "'rent_schedule_generated', 'charge_created', 'charge_updated', "
+            "'charge_activated', 'charge_generated')",
             name="ck_lease_audit_event_type",
         ),
         Index(
@@ -210,7 +236,13 @@ class RentSchedule(Base):
             "id", "organization_id", name="uq_rent_schedules_id_organization"
         ),
         CheckConstraint(
-            "charge_category = 'base_rent'", name="ck_rent_schedules_category"
+            "charge_category IN ('base_rent', 'service_charge', "
+            "'building_maintenance', 'insurance_contribution', "
+            "'shared_facilities', 'other_property_charge')",
+            name="ck_rent_schedules_category",
+        ),
+        CheckConstraint(
+            "length(trim(description)) > 0", name="ck_rent_schedules_description"
         ),
         CheckConstraint(
             "amount_per_period > 0", name="ck_rent_schedules_amount_positive"
@@ -243,6 +275,9 @@ class RentSchedule(Base):
     lease_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     charge_category: Mapped[str] = mapped_column(
         String(40), nullable=False, default="base_rent"
+    )
+    description: Mapped[str] = mapped_column(
+        String(250), nullable=False, default="Base rent"
     )
     amount_per_period: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     payment_frequency: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -307,3 +342,128 @@ class RentInstallment(Base):
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="expected")
     schedule: Mapped[RentSchedule] = relationship(back_populates="installments")
+
+
+class PropertyExpense(Base):
+    __tablename__ = "property_expenses"
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "organization_id", name="uq_property_expenses_id_organization"
+        ),
+        CheckConstraint(
+            "asset_level IN ('portfolio', 'site', 'building', 'unit')",
+            name="ck_property_expenses_asset_level",
+        ),
+        CheckConstraint(
+            "category IN ('utilities', 'maintenance', 'insurance', 'repairs', "
+            "'cleaning', 'security', 'shared_facilities', 'other')",
+            name="ck_property_expenses_category",
+        ),
+        CheckConstraint(
+            "length(trim(description)) > 0", name="ck_property_expenses_description"
+        ),
+        CheckConstraint("amount > 0", name="ck_property_expenses_amount_positive"),
+        CheckConstraint(
+            "currency IN ('GBP', 'EUR', 'USD')", name="ck_property_expenses_currency"
+        ),
+        CheckConstraint(
+            "recoverability IN ('recoverable', 'non_recoverable')",
+            name="ck_property_expenses_recoverability",
+        ),
+        CheckConstraint(
+            "(asset_level = 'portfolio' AND site_id IS NULL "
+            "AND building_id IS NULL AND unit_id IS NULL) OR "
+            "(asset_level = 'site' AND site_id IS NOT NULL "
+            "AND building_id IS NULL AND unit_id IS NULL) OR "
+            "(asset_level = 'building' AND site_id IS NOT NULL "
+            "AND building_id IS NOT NULL AND unit_id IS NULL) OR "
+            "(asset_level = 'unit' AND site_id IS NOT NULL "
+            "AND building_id IS NOT NULL AND unit_id IS NOT NULL)",
+            name="ck_property_expenses_asset_hierarchy",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "idempotency_key",
+            name="uq_property_expenses_idempotency",
+        ),
+        Index(
+            "ix_property_expenses_organization_date",
+            "organization_id",
+            "expense_date",
+        ),
+        Index(
+            "ix_property_expenses_organization_asset_date",
+            "organization_id",
+            "asset_level",
+            "portfolio_id",
+            "site_id",
+            "building_id",
+            "unit_id",
+            "expense_date",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    idempotency_key: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    asset_level: Mapped[str] = mapped_column(String(20), nullable=False)
+    portfolio_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    site_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    building_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    unit_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    description: Mapped[str] = mapped_column(String(250), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    expense_date: Mapped[date] = mapped_column(Date, nullable=False)
+    recoverability: Mapped[str] = mapped_column(String(20), nullable=False)
+    manual_review_reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    audit_events: Mapped[list["PropertyExpenseAuditEvent"]] = relationship(
+        back_populates="expense", cascade="all, delete-orphan"
+    )
+
+
+class PropertyExpenseAuditEvent(Base):
+    __tablename__ = "property_expense_audit_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["expense_id", "organization_id"],
+            ["property_expenses.id", "property_expenses.organization_id"],
+            name="fk_property_expense_audit_expense_organization",
+        ),
+        CheckConstraint(
+            "event_type IN ('created', 'updated')",
+            name="ck_property_expense_audit_event_type",
+        ),
+        Index(
+            "ix_property_expense_audit_organization_expense_occurred",
+            "organization_id",
+            "expense_id",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    expense_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expense: Mapped[PropertyExpense] = relationship(back_populates="audit_events")

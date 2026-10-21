@@ -70,6 +70,7 @@ function setupFetch(records: LeaseSummary[], canCreate = true) {
     if (/^\/api\/leases\/[^/]+\/rent-schedules$/.test(url.pathname)) {
       return Response.json([]);
     }
+    if (url.pathname === '/api/property-expenses') return Response.json([]);
     if (url.pathname === '/api/portfolios') return Response.json([]);
     return Response.json({ error: 'not found' }, { status: 404 });
   };
@@ -398,6 +399,7 @@ test('stale Unit details remain visible and allow termination without resubmitti
         ],
       });
     }
+    if (url.pathname === '/api/property-expenses') return Response.json([]);
     return Response.json({ error: 'not found' }, { status: 404 });
   };
   window.history.replaceState({}, '', `/leases/${leaseId}?organizationId=${organizationId}`);
@@ -489,14 +491,15 @@ test('rent schedule form validates exact decimal text, creates expected instalme
       }
       return Response.json(scheduleCreated ? [schedule] : []);
     }
+    if (url.pathname === '/api/property-expenses') return Response.json([]);
     return Response.json({ error: 'not found' }, { status: 404 });
   };
   window.history.replaceState({}, '', `/leases/${leaseId}?organizationId=${organizationId}`);
   const user = userEvent.setup();
   try {
     render(<LeasePage mode="detail" leaseId={leaseId} />);
-    await screen.findByRole('heading', { name: 'Rent schedules' });
-    await user.click(screen.getByRole('button', { name: 'Create rent schedule' }));
+    await screen.findByRole('heading', { name: 'Rent and service charge schedules' });
+    await user.click(screen.getByRole('button', { name: 'Create schedule' }));
     await user.type(screen.getByLabelText(/Amount per instalment/), '0');
     await user.click(screen.getByRole('button', { name: 'Create draft schedule' }));
     assert.match((await screen.findByRole('alert')).textContent ?? '', /positive fixed amount/);
@@ -510,7 +513,7 @@ test('rent schedule form validates exact decimal text, creates expected instalme
 
     assert.equal(submittedBody?.amount_per_period, '900719925474.10');
     assert.equal(submittedBody?.short_month_rule, 'clamp_to_month_end');
-    assert.ok(await screen.findByRole('table', { name: 'Expected rent instalments for this schedule' }));
+    assert.ok(await screen.findByRole('table', { name: 'Expected instalments for this schedule' }));
     assert.equal(screen.getAllByText('GBP 900719925474.10').length, 2);
     assert.ok(await screen.findByText('Rent schedule created'));
     assert.ok(screen.getByText(/No partial amount has been calculated/));
@@ -540,15 +543,130 @@ test('rent schedule controls are hidden for read-only lease users', async () => 
     if (url.pathname === `/api/leases/${leaseId}/rent-schedules`) {
       return Response.json([]);
     }
+    if (url.pathname === '/api/property-expenses') return Response.json([]);
     return Response.json({ error: 'not found' }, { status: 404 });
   };
   window.history.replaceState({}, '', `/leases/${leaseId}?organizationId=${organizationId}`);
   try {
     render(<LeasePage mode="detail" leaseId={leaseId} />);
-    await screen.findByRole('heading', { name: 'Rent schedules' });
-    assert.equal(screen.queryByRole('button', { name: 'Create rent schedule' }), null);
+    await screen.findByRole('heading', { name: 'Rent and service charge schedules' });
+    assert.equal(screen.queryByRole('button', { name: 'Create schedule' }), null);
     assert.equal(screen.queryByRole('button', { name: 'Edit lease' }), null);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('property expense register records recoverable expenses and prevents duplicate submit while pending', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  const originalCrypto = globalThis.crypto;
+  const leaseId = '00000000-0000-4000-8000-000000000801';
+  const lease: Lease = {
+    ...makeLease(1),
+    id: leaseId,
+    units: makeLease(1).units.map((unit) => ({
+      ...unit,
+      verified_status: 'active' as const,
+    })),
+    audit_events: [],
+  };
+  const portfolioId = '00000000-0000-4000-8000-000000000201';
+  const siteId = '00000000-0000-4000-8000-000000000301';
+  const buildingId = '00000000-0000-4000-8000-000000000401';
+  const unitId = '00000000-0000-4000-8000-000000000501';
+  const expense = {
+    id: '00000000-0000-4000-8000-000000000970',
+    organization_id: organizationId,
+    asset_level: 'unit',
+    portfolio_id: portfolioId,
+    site_id: siteId,
+    building_id: buildingId,
+    unit_id: unitId,
+    category: 'maintenance',
+    description: 'HVAC repair',
+    amount: '420.50',
+    currency: 'GBP',
+    expense_date: '2026-05-20',
+    recoverability: 'recoverable',
+    manual_review_reasons: ['allocation_not_configured', 'recovery_terms_not_verified'],
+    audit_events: [
+      {
+        actor_id: '00000000-0000-4000-8000-000000000901',
+        event_type: 'created',
+        changed_fields: ['amount'],
+        occurred_at: now,
+      },
+    ],
+    created_at: now,
+    updated_at: now,
+  };
+  let createCalls = 0;
+  let postedBody: Record<string, unknown> | undefined;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input), window.location.origin);
+    if (url.pathname === '/api/leases/permissions') {
+      return Response.json({ can_read: true, can_create: true, can_update: true });
+    }
+    if (url.pathname === `/api/leases/${leaseId}`) return Response.json(lease);
+    if (url.pathname === `/api/leases/${leaseId}/rent-schedules`) return Response.json([]);
+    if (url.pathname === '/api/property-expenses' && init?.method === 'GET') {
+      return Response.json(createCalls > 0 ? [expense] : []);
+    }
+    if (url.pathname === '/api/property-expenses' && init?.method === 'POST') {
+      createCalls += 1;
+      postedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return Response.json(expense, { status: 201 });
+    }
+    if (url.pathname === '/api/portfolios') {
+      return Response.json([{ id: portfolioId, organization_id: organizationId, name: 'Portfolio 1', status: 'active', created_at: now, updated_at: now }]);
+    }
+    if (url.pathname === `/api/portfolios/${portfolioId}/sites`) {
+      return Response.json([{ id: siteId, organization_id: organizationId, portfolio_id: portfolioId, name: 'Site 1', address: null, status: 'active', created_at: now, updated_at: now }]);
+    }
+    if (url.pathname === `/api/portfolios/${portfolioId}/sites/${siteId}/buildings`) {
+      return Response.json([{ id: buildingId, organization_id: organizationId, site_id: siteId, name: 'Building 1', building_code: null, address: null, status: 'active', created_at: now, updated_at: now }]);
+    }
+    if (url.pathname === `/api/portfolios/${portfolioId}/sites/${siteId}/buildings/${buildingId}/units`) {
+      return Response.json([{ id: unitId, organization_id: organizationId, building_id: buildingId, name: 'Unit 1', unit_code: 'U1', floor: null, area_sqm: null, status: 'active', created_at: now, updated_at: now }]);
+    }
+    return Response.json({ error: 'not found' }, { status: 404 });
+  };
+  window.history.replaceState({}, '', `/leases/${leaseId}?organizationId=${organizationId}`);
+  const user = userEvent.setup();
+  try {
+    render(<LeasePage mode="detail" leaseId={leaseId} />);
+    await screen.findByRole('heading', { name: 'Property expense register' });
+    await user.click(screen.getByRole('button', { name: 'Record property expense' }));
+    await user.selectOptions(screen.getByLabelText('Expense portfolio'), portfolioId);
+    await user.selectOptions(screen.getByLabelText('Expense site'), siteId);
+    await user.selectOptions(screen.getByLabelText('Expense building'), buildingId);
+    await user.selectOptions(screen.getByLabelText('Expense unit'), unitId);
+    await user.type(screen.getByLabelText('Description'), 'HVAC repair');
+    await user.type(screen.getByLabelText('Amount'), '420.50');
+    await user.type(screen.getByLabelText('Expense date'), '2026-05-20');
+    Object.defineProperty(globalThis, 'crypto', {
+      configurable: true,
+      value: {
+        getRandomValues: originalCrypto.getRandomValues.bind(originalCrypto),
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Record expense' }));
+    assert.equal(createCalls, 1);
+    assert.equal(postedBody?.amount, '420.50');
+    assert.equal(postedBody?.recoverability, 'recoverable');
+    assert.match(
+      String(postedBody?.idempotency_key),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    assert.ok(await screen.findByText(/Manual review required: allocation not configured/));
+    assert.ok(screen.getByText(/does not create tenant charge schedules/));
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCryptoDescriptor) {
+      Object.defineProperty(globalThis, 'crypto', originalCryptoDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, 'crypto');
+    }
   }
 });

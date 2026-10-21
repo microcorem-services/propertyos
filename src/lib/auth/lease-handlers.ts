@@ -16,6 +16,24 @@ const CURRENCIES = new Set(['GBP', 'EUR', 'USD']);
 const FREQUENCIES = new Set(['monthly', 'quarterly', 'annually']);
 const PARTY_ROLES = new Set(['landlord', 'tenant', 'guarantor']);
 const PARTY_TYPES = new Set(['individual', 'organization']);
+const CHARGE_CATEGORIES = new Set([
+  'base_rent',
+  'service_charge',
+  'building_maintenance',
+  'insurance_contribution',
+  'shared_facilities',
+  'other_property_charge',
+]);
+const EXPENSE_CATEGORIES = new Set([
+  'utilities',
+  'maintenance',
+  'insurance',
+  'repairs',
+  'cleaning',
+  'security',
+  'shared_facilities',
+  'other',
+]);
 
 type RetrievedSession = { data: Record<string, string> };
 type SessionManager = {
@@ -131,6 +149,10 @@ function isLeaseRecord(
           'rent_schedule_updated',
           'rent_schedule_activated',
           'rent_schedule_generated',
+          'charge_created',
+          'charge_updated',
+          'charge_activated',
+          'charge_generated',
         ].includes(String(event.event_type)) &&
         Array.isArray(event.changed_fields) &&
         event.changed_fields.every((field) => typeof field === 'string') &&
@@ -210,7 +232,9 @@ function isRentSchedule(
     value.organization_id.toLowerCase() === organizationId.toLowerCase() &&
     isUUID(value.lease_id) &&
     value.lease_id.toLowerCase() === leaseId.toLowerCase() &&
-    value.charge_category === 'base_rent' &&
+    CHARGE_CATEGORIES.has(String(value.charge_category)) &&
+    typeof value.description === 'string' &&
+    value.description.trim().length > 0 &&
     typeof value.amount_per_period === 'string' &&
     /^\d{1,12}\.\d{2}$/.test(value.amount_per_period) &&
     CURRENCIES.has(String(value.currency)) &&
@@ -230,6 +254,65 @@ function isRentSchedule(
         reason === 'end_not_on_period_boundary',
     ) &&
     installmentsValid &&
+    isTimestamp(value.created_at) &&
+    isTimestamp(value.updated_at)
+  );
+}
+
+function isPropertyExpense(value: unknown, organizationId: string): boolean {
+  if (!isRecord(value)) return false;
+  const hierarchyValid =
+    (value.asset_level === 'portfolio' &&
+      value.site_id === null &&
+      value.building_id === null &&
+      value.unit_id === null) ||
+    (value.asset_level === 'site' &&
+      isUUID(value.site_id) &&
+      value.building_id === null &&
+      value.unit_id === null) ||
+    (value.asset_level === 'building' &&
+      isUUID(value.site_id) &&
+      isUUID(value.building_id) &&
+      value.unit_id === null) ||
+    (value.asset_level === 'unit' &&
+      isUUID(value.site_id) &&
+      isUUID(value.building_id) &&
+      isUUID(value.unit_id));
+  return (
+    hierarchyValid &&
+    isUUID(value.id) &&
+    isUUID(value.organization_id) &&
+    value.organization_id.toLowerCase() === organizationId.toLowerCase() &&
+    ['portfolio', 'site', 'building', 'unit'].includes(String(value.asset_level)) &&
+    isUUID(value.portfolio_id) &&
+    (value.site_id === null || isUUID(value.site_id)) &&
+    (value.building_id === null || isUUID(value.building_id)) &&
+    (value.unit_id === null || isUUID(value.unit_id)) &&
+    EXPENSE_CATEGORIES.has(String(value.category)) &&
+    typeof value.description === 'string' &&
+    value.description.trim().length > 0 &&
+    typeof value.amount === 'string' &&
+    /^\d{1,12}\.\d{2}$/.test(value.amount) &&
+    CURRENCIES.has(String(value.currency)) &&
+    isDate(value.expense_date) &&
+    (value.recoverability === 'recoverable' ||
+      value.recoverability === 'non_recoverable') &&
+    Array.isArray(value.manual_review_reasons) &&
+    value.manual_review_reasons.every(
+      (reason) =>
+        reason === 'allocation_not_configured' ||
+        reason === 'recovery_terms_not_verified',
+    ) &&
+    Array.isArray(value.audit_events) &&
+    value.audit_events.every(
+      (event) =>
+        isRecord(event) &&
+        isUUID(event.actor_id) &&
+        (event.event_type === 'created' || event.event_type === 'updated') &&
+        Array.isArray(event.changed_fields) &&
+        event.changed_fields.every((field) => typeof field === 'string') &&
+        isTimestamp(event.occurred_at),
+    ) &&
     isTimestamp(value.created_at) &&
     isTimestamp(value.updated_at)
   );
@@ -392,21 +475,41 @@ async function readJsonResponse(response: Response): Promise<unknown> {
 
 function statusError(
   status: number,
-  detail: 'list' | 'detail' | 'write' | 'schedule',
+  detail: 'list' | 'detail' | 'write' | 'schedule' | 'expense',
 ): Response {
   if (status === 401) return errorResponse(401, 'Authentication required.');
   if (status === 403) return errorResponse(403, 'Organisation access denied.');
   if (status === 404) {
     return errorResponse(
       404,
-      detail === 'schedule' ? 'Rent schedule not found.' : 'Lease not found.',
+      detail === 'schedule'
+        ? 'Rent schedule not found.'
+        : detail === 'expense'
+          ? 'Property expense not found.'
+          : 'Lease not found.',
     );
   }
-  if (status === 409) return errorResponse(409, 'Lease conflicts with existing data.');
-  if (status === 422) return errorResponse(400, 'Lease information is invalid.');
+  if (status === 409) {
+    return errorResponse(
+      409,
+      detail === 'expense'
+        ? 'Property expense conflicts with existing data.'
+        : 'Lease conflicts with existing data.',
+    );
+  }
+  if (status === 422) {
+    return errorResponse(
+      400,
+      detail === 'expense' ? 'Property expense information is invalid.' : 'Lease information is invalid.',
+    );
+  }
   return errorResponse(
     503,
-    detail === 'write' ? 'Lease could not be saved.' : 'Lease service unavailable.',
+    detail === 'write'
+      ? 'Lease could not be saved.'
+      : detail === 'expense'
+        ? 'Property Expense service unavailable.'
+        : 'Lease service unavailable.',
   );
 }
 
@@ -423,7 +526,7 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     organizationId: string,
     expectedStatus: number,
     body?: unknown,
-    detail: 'list' | 'detail' | 'write' | 'schedule' = 'detail',
+    detail: 'list' | 'detail' | 'write' | 'schedule' | 'expense' = 'detail',
   ): Promise<Response> {
     try {
       const token = await readAccessToken(request, dependencies.sessions, now);
@@ -672,6 +775,256 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     }
   }
 
+  function expenseContext(
+    request: Request,
+    expenseId?: string,
+  ): { organizationId: string; path: string } | Response {
+    const url = new URL(request.url);
+    const organizationId = readOrganizationId(url);
+    if (
+      !organizationId ||
+      (expenseId !== undefined && !isUUID(expenseId)) ||
+      [...url.searchParams.keys()].some(
+        (key) => !['organizationId', 'limit', 'offset', 'asset_level'].includes(key),
+      ) ||
+      url.searchParams.getAll('organizationId').length !== 1
+    ) {
+      return errorResponse(400, 'Invalid property expense request.');
+    }
+    return {
+      organizationId,
+      path: `${API_PREFIX}/${organizationId}/property-expenses${
+        expenseId ? `/${expenseId}` : ''
+      }`,
+    };
+  }
+
+  function isPropertyExpenseCreateBody(value: unknown): boolean {
+    if (!isRecord(value)) return false;
+    const allowed = new Set([
+      'idempotency_key',
+      'asset_level',
+      'portfolio_id',
+      'site_id',
+      'building_id',
+      'unit_id',
+      'category',
+      'description',
+      'amount',
+      'currency',
+      'expense_date',
+      'recoverability',
+    ]);
+    if (Object.keys(value).some((key) => !allowed.has(key))) return false;
+    const required = [
+      'idempotency_key',
+      'asset_level',
+      'portfolio_id',
+      'category',
+      'description',
+      'amount',
+      'currency',
+      'expense_date',
+      'recoverability',
+    ];
+    if (required.some((key) => !(key in value))) return false;
+    const hierarchyValid =
+      (value.asset_level === 'portfolio' &&
+        !('site_id' in value) &&
+        !('building_id' in value) &&
+        !('unit_id' in value)) ||
+      (value.asset_level === 'site' &&
+        isUUID(value.site_id) &&
+        !('building_id' in value) &&
+        !('unit_id' in value)) ||
+      (value.asset_level === 'building' &&
+        isUUID(value.site_id) &&
+        isUUID(value.building_id) &&
+        !('unit_id' in value)) ||
+      (value.asset_level === 'unit' &&
+        isUUID(value.site_id) &&
+        isUUID(value.building_id) &&
+        isUUID(value.unit_id));
+    return (
+      hierarchyValid &&
+      isUUID(value.idempotency_key) &&
+      isUUID(value.portfolio_id) &&
+      EXPENSE_CATEGORIES.has(String(value.category)) &&
+      typeof value.description === 'string' &&
+      value.description.trim().length > 0 &&
+      value.description.length <= 250 &&
+      typeof value.amount === 'string' &&
+      /^\d{1,12}\.\d{2}$/.test(value.amount) &&
+      CURRENCIES.has(String(value.currency)) &&
+      isDate(value.expense_date) &&
+      (value.recoverability === 'recoverable' ||
+        value.recoverability === 'non_recoverable')
+    );
+  }
+
+  function isPropertyExpenseUpdateBody(value: unknown): boolean {
+    if (!isRecord(value)) return false;
+    const keys = Object.keys(value);
+    if (keys.length === 0) return false;
+    if (
+      keys.some(
+        (key) =>
+          ![
+            'category',
+            'description',
+            'amount',
+            'currency',
+            'expense_date',
+            'recoverability',
+          ].includes(key),
+      )
+    ) {
+      return false;
+    }
+    if (value.category !== undefined && !EXPENSE_CATEGORIES.has(String(value.category))) {
+      return false;
+    }
+    if (
+      value.description !== undefined &&
+      (typeof value.description !== 'string' ||
+        value.description.trim().length === 0 ||
+        value.description.length > 250)
+    ) {
+      return false;
+    }
+    if (
+      value.amount !== undefined &&
+      (typeof value.amount !== 'string' ||
+        !/^\d{1,12}\.\d{2}$/.test(value.amount))
+    ) {
+      return false;
+    }
+    if (value.currency !== undefined && !CURRENCIES.has(String(value.currency))) {
+      return false;
+    }
+    if (value.expense_date !== undefined && !isDate(value.expense_date)) {
+      return false;
+    }
+    if (
+      value.recoverability !== undefined &&
+      value.recoverability !== 'recoverable' &&
+      value.recoverability !== 'non_recoverable'
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  async function listPropertyExpenses(request: Request): Promise<Response> {
+    const context = expenseContext(request);
+    if (context instanceof Response) return context;
+    const url = new URL(request.url);
+    const limitRaw = url.searchParams.get('limit') ?? '50';
+    const offsetRaw = url.searchParams.get('offset') ?? '0';
+    const limit = Number(limitRaw);
+    const offset = Number(offsetRaw);
+    const assetLevel = url.searchParams.get('asset_level');
+    if (
+      !/^(?:[1-9]\d?|100)$/.test(limitRaw) ||
+      !/^(?:0|[1-9]\d{0,4})$/.test(offsetRaw) ||
+      !Number.isSafeInteger(limit) ||
+      limit > 100 ||
+      !Number.isSafeInteger(offset) ||
+      offset > 10_000 ||
+      (assetLevel !== null &&
+        !['portfolio', 'site', 'building', 'unit'].includes(assetLevel))
+    ) {
+      return errorResponse(400, 'Invalid property expense request.');
+    }
+    const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (assetLevel) query.set('asset_level', assetLevel);
+    const response = await perform(
+      request,
+      'GET',
+      `${context.path}?${query}`,
+      context.organizationId,
+      200,
+      undefined,
+      'expense',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (
+      !Array.isArray(payload) ||
+      payload.length > limit ||
+      payload.some((expense) => !isPropertyExpense(expense, context.organizationId))
+    ) {
+      return errorResponse(502, 'Invalid Property Expense response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function writePropertyExpense(
+    request: Request,
+    expenseId?: string,
+  ): Promise<Response> {
+    const context = expenseContext(request, expenseId);
+    if (context instanceof Response) return context;
+    try {
+      if (!isSameOriginWriteRequest(request, (dependencies.appOrigin ?? loadAppOrigin)())) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      const body = await readJsonBody(request);
+      if (
+        expenseId === undefined
+          ? !isPropertyExpenseCreateBody(body)
+          : !isPropertyExpenseUpdateBody(body)
+      ) {
+        return errorResponse(400, 'Invalid property expense request.');
+      }
+      const expectedStatus = expenseId === undefined ? 201 : 200;
+      const response = await perform(
+        request,
+        expenseId === undefined ? 'POST' : 'PATCH',
+        context.path,
+        context.organizationId,
+        expectedStatus,
+        body,
+        'expense',
+      );
+      if (response.status !== expectedStatus) return response;
+      const payload: unknown = await response.json();
+      if (!isPropertyExpense(payload, context.organizationId)) {
+        return errorResponse(502, 'Invalid Property Expense response.');
+      }
+      return Response.json(payload, {
+        status: expectedStatus,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(400, 'Invalid property expense request.');
+    }
+  }
+
+  async function getPropertyExpense(request: Request, expenseId: string): Promise<Response> {
+    const context = expenseContext(request, expenseId);
+    if (context instanceof Response) return context;
+    const response = await perform(
+      request,
+      'GET',
+      context.path,
+      context.organizationId,
+      200,
+      undefined,
+      'expense',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (!isPropertyExpense(payload, context.organizationId)) {
+      return errorResponse(502, 'Invalid Property Expense response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
   async function detail(
     request: Request,
     leaseId: string,
@@ -768,6 +1121,11 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
       leaseId: string,
       scheduleId: string,
     ) => writeRentSchedule(request, leaseId, scheduleId, 'generate'),
+    listPropertyExpenses,
+    createPropertyExpense: (request: Request) => writePropertyExpense(request),
+    getPropertyExpense,
+    updatePropertyExpense: (request: Request, expenseId: string) =>
+      writePropertyExpense(request, expenseId),
     detail,
     create: (request: Request, organizationId: string) =>
       write(request, organizationId),

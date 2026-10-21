@@ -37,10 +37,18 @@ import {
   LeaseRequestError,
   updateLease,
   createRentSchedule,
+  createPropertyExpense,
   fetchRentSchedules,
+  fetchPropertyExpenses,
   generateRentSchedule,
+  updatePropertyExpense,
   updateRentSchedule,
   type Lease,
+  type PropertyExpense,
+  type PropertyExpenseAssetLevel,
+  type PropertyExpenseCategory,
+  type PropertyExpenseFields,
+  type PropertyExpenseUpdateFields,
   type LeaseFields,
   type LeasePartyInput,
   type LeasePaymentFrequency,
@@ -57,6 +65,22 @@ const PAGE_SIZE = 20;
 const STATUSES: LeaseStatus[] = ['draft', 'active', 'expired', 'terminated'];
 const CURRENCIES = ['GBP', 'EUR', 'USD'] as const;
 const FREQUENCIES: LeasePaymentFrequency[] = ['monthly', 'quarterly', 'annually'];
+const EXPENSE_ASSET_LEVELS: PropertyExpenseAssetLevel[] = [
+  'portfolio',
+  'site',
+  'building',
+  'unit',
+];
+const EXPENSE_CATEGORIES: PropertyExpenseCategory[] = [
+  'utilities',
+  'maintenance',
+  'insurance',
+  'repairs',
+  'cleaning',
+  'security',
+  'shared_facilities',
+  'other',
+];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -72,6 +96,20 @@ type LeaseFormValues = {
   payment_frequency: LeasePaymentFrequency;
   status: LeaseStatus;
   parties: LeasePartyInput[];
+};
+
+type PropertyExpenseFormState = {
+  asset_level: PropertyExpenseAssetLevel;
+  portfolio_id: string;
+  site_id: string;
+  building_id: string;
+  unit_id: string;
+  category: PropertyExpenseCategory;
+  description: string;
+  amount: string;
+  currency: Lease['currency'];
+  expense_date: string;
+  recoverability: 'recoverable' | 'non_recoverable';
 };
 
 function formatDate(value: string): string {
@@ -137,6 +175,38 @@ function leaseError(error: unknown, fallback: string): LeaseRequestError {
   return error instanceof LeaseRequestError
     ? error
     : new LeaseRequestError(fallback, 503);
+}
+
+function propertyExpenseError(error: unknown, fallback: string): Error {
+  return error instanceof LeaseRequestError || error instanceof PortfoliosRequestError
+    ? error
+    : new Error(fallback);
+}
+
+function expenseAssetLabel(expense: PropertyExpense): string {
+  if (expense.asset_level === 'portfolio') return `Portfolio ${expense.portfolio_id.slice(0, 8)}`;
+  if (expense.asset_level === 'site') return `Site ${expense.site_id?.slice(0, 8) ?? 'unknown'}`;
+  if (expense.asset_level === 'building') return `Building ${expense.building_id?.slice(0, 8) ?? 'unknown'}`;
+  return `Unit ${expense.unit_id?.slice(0, 8) ?? 'unknown'}`;
+}
+
+function expenseCategoryLabel(category: PropertyExpenseCategory): string {
+  return category.replaceAll('_', ' ');
+}
+
+function newIdempotencyKey(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') {
+    return cryptoApi.randomUUID();
+  }
+  if (typeof cryptoApi?.getRandomValues !== 'function') {
+    throw new Error('Secure random number generation is unavailable.');
+  }
+  const bytes = cryptoApi.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0'));
+  return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
 }
 
 function SiteHeader({ backHref }: { backHref: string }) {
@@ -715,6 +785,8 @@ function LeaseForm({
 }
 
 type RentScheduleFormState = {
+  charge_category: RentSchedule['charge_category'];
+  description: string;
   amount_per_period: string;
   payment_frequency: RentScheduleFrequency;
   start_date: string;
@@ -736,6 +808,8 @@ function RentScheduleForm({
   onSaved: (value: RentSchedule) => void;
 }) {
   const [values, setValues] = useState<RentScheduleFormState>({
+    charge_category: schedule?.charge_category ?? 'base_rent',
+    description: schedule?.description ?? 'Base rent',
     amount_per_period: schedule?.amount_per_period ?? '',
     payment_frequency: schedule?.payment_frequency ?? 'monthly',
     start_date: schedule?.start_date ?? lease.start_date,
@@ -766,6 +840,8 @@ function RentScheduleForm({
       return;
     }
     const fields: RentScheduleFields = {
+      charge_category: values.charge_category,
+      description: values.description.trim(),
       amount_per_period: amount.includes('.') ? amount : `${amount}.00`,
       payment_frequency: values.payment_frequency,
       start_date: values.start_date,
@@ -791,11 +867,44 @@ function RentScheduleForm({
   return (
     <form className="lease-form rent-schedule-form" onSubmit={(event) => void submit(event)}>
       <fieldset disabled={saving}>
-        <legend>{schedule ? 'Edit draft rent schedule' : 'Create rent schedule'}</legend>
+        <legend>{schedule ? 'Edit draft charge schedule' : 'Create rent or charge schedule'}</legend>
         <p className="lease-field-note">
           Amounts are fixed per scheduled instalment. No amount is prorated. A schedule boundary within a payment period is flagged for manual review.
         </p>
         <div className="lease-form-grid">
+          <label>
+            Charge category
+            <select
+              value={values.charge_category}
+              onChange={(event) => setValues((current) => ({
+                ...current,
+                charge_category: event.target.value as RentSchedule['charge_category'],
+                description:
+                  current.description === 'Base rent' && event.target.value !== 'base_rent'
+                    ? ''
+                    : current.description,
+              }))}
+            >
+              <option value="base_rent">Base rent</option>
+              <option value="service_charge">Service charge</option>
+              <option value="building_maintenance">Building maintenance</option>
+              <option value="insurance_contribution">Insurance contribution</option>
+              <option value="shared_facilities">Shared facilities / common areas</option>
+              <option value="other_property_charge">Other property charge</option>
+            </select>
+          </label>
+          <label>
+            Description
+            <input
+              required
+              maxLength={250}
+              value={values.description}
+              onChange={(event) => setValues((current) => ({
+                ...current,
+                description: event.target.value,
+              }))}
+            />
+          </label>
           <label>
             Amount per instalment ({lease.currency})
             <input
@@ -946,14 +1055,14 @@ function RentSchedulesPanel({
   return (
     <section className="lease-rent-schedules" aria-labelledby="rent-schedules-heading">
       <div className="lease-section-heading">
-        <h3 id="rent-schedules-heading">Rent schedules</h3>
+        <h3 id="rent-schedules-heading">Rent and service charge schedules</h3>
         {canUpdate && lease.status !== 'expired' && lease.status !== 'terminated' && !creating && !editingSchedule && (
           <button
             className="bow-era-button bow-era-button-secondary"
             type="button"
             onClick={() => setCreating(true)}
           >
-            Create rent schedule
+            Create schedule
           </button>
         )}
       </div>
@@ -963,7 +1072,7 @@ function RentSchedulesPanel({
       {loading ? <p role="status">Loading rent schedules…</p> : null}
       {error && <p className="lease-form-error" role="alert">{error}</p>}
       {!loading && schedules.length === 0 && !creating && (
-        <p>No rent schedules are recorded for this lease.</p>
+        <p>No rent or service charge schedules are recorded for this lease.</p>
       )}
       {schedules.map((schedule) => (
         <article className="lease-rent-schedule" key={schedule.id}>
@@ -1017,7 +1126,7 @@ function RentSchedulesPanel({
           )}
           <div className="lease-table-wrap lease-installments-wrap">
             <table className="lease-table lease-installments-table">
-              <caption>Expected rent instalments for this schedule</caption>
+              <caption>Expected instalments for this schedule</caption>
               <thead>
                 <tr><th scope="col">Due date</th><th scope="col">Expected amount</th><th scope="col">Status</th></tr>
               </thead>
@@ -1060,6 +1169,479 @@ function RentSchedulesPanel({
           }}
         />
       )}
+    </section>
+  );
+}
+
+function PropertyExpenseForm({
+  organizationId,
+  defaultCurrency,
+  expense,
+  saving,
+  onCancel,
+  onSaved,
+}: {
+  organizationId: string;
+  defaultCurrency: Lease['currency'];
+  expense?: PropertyExpense;
+  saving: boolean;
+  onCancel: () => void;
+  onSaved: (value: PropertyExpense) => void;
+}) {
+  const [values, setValues] = useState<PropertyExpenseFormState>({
+    asset_level: expense?.asset_level ?? 'unit',
+    portfolio_id: expense?.portfolio_id ?? '',
+    site_id: expense?.site_id ?? '',
+    building_id: expense?.building_id ?? '',
+    unit_id: expense?.unit_id ?? '',
+    category: expense?.category ?? 'maintenance',
+    description: expense?.description ?? '',
+    amount: expense?.amount ?? '',
+    currency: expense?.currency ?? defaultCurrency,
+    expense_date: expense?.expense_date ?? '',
+    recoverability: expense?.recoverability ?? 'recoverable',
+  });
+  const [assetError, setAssetError] = useState('');
+  const [fieldError, setFieldError] = useState('');
+  const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
+  const [sites, setSites] = useState<Site[]>([]);
+  const [buildings, setBuildings] = useState<Building[]>([]);
+  const [units, setUnits] = useState<Unit[]>([]);
+  const [loadingAssets, setLoadingAssets] = useState(expense === undefined);
+
+  const isEdit = expense !== undefined;
+
+  useEffect(() => {
+    if (isEdit) return;
+    let active = true;
+    void fetchPortfolios(organizationId)
+      .then((items) => {
+        if (active) setPortfolios(items.filter((item) => item.status === 'active'));
+      })
+      .catch((reason) => {
+        if (active) setAssetError(propertyExpenseError(reason, 'Portfolios could not be loaded.').message);
+      })
+      .finally(() => {
+        if (active) setLoadingAssets(false);
+      });
+    return () => { active = false; };
+  }, [isEdit, organizationId]);
+
+  useEffect(() => {
+    if (isEdit) return;
+    let active = true;
+    setSites([]);
+    setBuildings([]);
+    setUnits([]);
+    setValues((current) => ({ ...current, site_id: '', building_id: '', unit_id: '' }));
+    if (!values.portfolio_id || values.asset_level === 'portfolio') return;
+    void fetchSites(values.portfolio_id, organizationId)
+      .then((items) => {
+        if (active) setSites(items.filter((item) => item.status === 'active'));
+      })
+      .catch((reason) => {
+        if (active) setAssetError(propertyExpenseError(reason, 'Sites could not be loaded.').message);
+      });
+    return () => { active = false; };
+  }, [isEdit, organizationId, values.asset_level, values.portfolio_id]);
+
+  useEffect(() => {
+    if (isEdit) return;
+    let active = true;
+    setBuildings([]);
+    setUnits([]);
+    setValues((current) => ({ ...current, building_id: '', unit_id: '' }));
+    if (!values.portfolio_id || !values.site_id || values.asset_level === 'site') return;
+    void fetchBuildings(values.portfolio_id, values.site_id, organizationId)
+      .then((items) => {
+        if (active) setBuildings(items.filter((item) => item.status === 'active'));
+      })
+      .catch((reason) => {
+        if (active) setAssetError(propertyExpenseError(reason, 'Buildings could not be loaded.').message);
+      });
+    return () => { active = false; };
+  }, [isEdit, organizationId, values.asset_level, values.portfolio_id, values.site_id]);
+
+  useEffect(() => {
+    if (isEdit) return;
+    let active = true;
+    setUnits([]);
+    setValues((current) => ({ ...current, unit_id: '' }));
+    if (
+      !values.portfolio_id ||
+      !values.site_id ||
+      !values.building_id ||
+      values.asset_level === 'building'
+    ) {
+      return;
+    }
+    void fetchUnits(values.portfolio_id, values.site_id, values.building_id, organizationId)
+      .then((items) => {
+        if (active) setUnits(items.filter((item) => item.status === 'active'));
+      })
+      .catch((reason) => {
+        if (active) setAssetError(propertyExpenseError(reason, 'Units could not be loaded.').message);
+      });
+    return () => { active = false; };
+  }, [isEdit, organizationId, values.asset_level, values.portfolio_id, values.site_id, values.building_id]);
+
+  async function submit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    setFieldError('');
+    const amount = values.amount.trim();
+    if (!/^\d{1,12}(?:\.\d{1,2})?$/.test(amount) || !/[1-9]/.test(amount.replace('.', ''))) {
+      setFieldError('Enter a positive amount with no more than two decimal places.');
+      return;
+    }
+    if (!values.description.trim() || values.description.trim().length > 250) {
+      setFieldError('Enter a description between 1 and 250 characters.');
+      return;
+    }
+    if (!values.expense_date) {
+      setFieldError('Select an expense date.');
+      return;
+    }
+    if (!isEdit) {
+      if (!values.portfolio_id) {
+        setFieldError('Select a portfolio for this expense.');
+        return;
+      }
+      if ((values.asset_level === 'site' || values.asset_level === 'building' || values.asset_level === 'unit') && !values.site_id) {
+        setFieldError('Select a site for this expense.');
+        return;
+      }
+      if ((values.asset_level === 'building' || values.asset_level === 'unit') && !values.building_id) {
+        setFieldError('Select a building for this expense.');
+        return;
+      }
+      if (values.asset_level === 'unit' && !values.unit_id) {
+        setFieldError('Select a unit for this expense.');
+        return;
+      }
+    }
+    try {
+      if (isEdit) {
+        const payload: PropertyExpenseUpdateFields = {
+          category: values.category,
+          description: values.description.trim(),
+          amount: amount.includes('.') ? amount : `${amount}.00`,
+          currency: values.currency,
+          expense_date: values.expense_date,
+          recoverability: values.recoverability,
+        };
+        onSaved(await updatePropertyExpense(organizationId, expense.id, payload));
+      } else {
+        const payload: PropertyExpenseFields = {
+          idempotency_key: newIdempotencyKey(),
+          asset_level: values.asset_level,
+          portfolio_id: values.portfolio_id,
+          ...(values.site_id ? { site_id: values.site_id } : {}),
+          ...(values.building_id ? { building_id: values.building_id } : {}),
+          ...(values.unit_id ? { unit_id: values.unit_id } : {}),
+          category: values.category,
+          description: values.description.trim(),
+          amount: amount.includes('.') ? amount : `${amount}.00`,
+          currency: values.currency,
+          expense_date: values.expense_date,
+          recoverability: values.recoverability,
+        };
+        onSaved(await createPropertyExpense(organizationId, payload));
+      }
+    } catch (reason) {
+      setFieldError(propertyExpenseError(reason, 'The property expense could not be saved.').message);
+    }
+  }
+
+  return (
+    <form className="lease-form rent-schedule-form" onSubmit={(event) => void submit(event)}>
+      <fieldset disabled={saving}>
+        <legend>{isEdit ? 'Edit property expense' : 'Record property expense'}</legend>
+        <p className="lease-field-note">
+          Expenses remain separate from tenant obligations. Recoverable expenses are flagged for manual review and allocation decisions.
+        </p>
+        {!isEdit && loadingAssets ? <p role="status">Loading authorised property hierarchy…</p> : null}
+        {assetError ? <p className="lease-form-error" role="alert">{assetError}</p> : null}
+        <div className="lease-form-grid">
+          {!isEdit && (
+            <>
+              <label>
+                Asset level
+                <select
+                  value={values.asset_level}
+                  onChange={(event) =>
+                    setValues((current) => ({
+                      ...current,
+                      asset_level: event.target.value as PropertyExpenseAssetLevel,
+                    }))}
+                >
+                  {EXPENSE_ASSET_LEVELS.map((item) => (
+                    <option key={item} value={item}>{item}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Portfolio
+                <select
+                  aria-label="Expense portfolio"
+                  value={values.portfolio_id}
+                  onChange={(event) => setValues((current) => ({ ...current, portfolio_id: event.target.value }))}
+                >
+                  <option value="">Choose portfolio</option>
+                  {portfolios.map((item) => (
+                    <option key={item.id} value={item.id}>{item.name}</option>
+                  ))}
+                </select>
+              </label>
+              {values.asset_level !== 'portfolio' && (
+                <label>
+                  Site
+                  <select
+                    aria-label="Expense site"
+                    value={values.site_id}
+                    disabled={!values.portfolio_id}
+                    onChange={(event) => setValues((current) => ({ ...current, site_id: event.target.value }))}
+                  >
+                    <option value="">Choose site</option>
+                    {sites.map((item) => (
+                      <option key={item.id} value={item.id}>{item.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {(values.asset_level === 'building' || values.asset_level === 'unit') && (
+                <label>
+                  Building
+                  <select
+                    aria-label="Expense building"
+                    value={values.building_id}
+                    disabled={!values.site_id}
+                    onChange={(event) => setValues((current) => ({ ...current, building_id: event.target.value }))}
+                  >
+                    <option value="">Choose building</option>
+                    {buildings.map((item) => (
+                      <option key={item.id} value={item.id}>{item.name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {values.asset_level === 'unit' && (
+                <label>
+                  Unit
+                  <select
+                    aria-label="Expense unit"
+                    value={values.unit_id}
+                    disabled={!values.building_id}
+                    onChange={(event) => setValues((current) => ({ ...current, unit_id: event.target.value }))}
+                  >
+                    <option value="">Choose active unit</option>
+                    {units.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}{item.unit_code ? ` (${item.unit_code})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </>
+          )}
+          <label>
+            Category
+            <select
+              value={values.category}
+              onChange={(event) => setValues((current) => ({ ...current, category: event.target.value as PropertyExpenseCategory }))}
+            >
+              {EXPENSE_CATEGORIES.map((category) => (
+                <option key={category} value={category}>{expenseCategoryLabel(category)}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Description
+            <input
+              required
+              maxLength={250}
+              value={values.description}
+              onChange={(event) => setValues((current) => ({ ...current, description: event.target.value }))}
+            />
+          </label>
+          <label>
+            Amount
+            <input
+              required
+              inputMode="decimal"
+              value={values.amount}
+              onChange={(event) => setValues((current) => ({ ...current, amount: event.target.value }))}
+            />
+          </label>
+          <label>
+            Currency
+            <select
+              value={values.currency}
+              onChange={(event) => setValues((current) => ({ ...current, currency: event.target.value as Lease['currency'] }))}
+            >
+              {CURRENCIES.map((currency) => (
+                <option key={currency} value={currency}>{currency}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Expense date
+            <input
+              type="date"
+              required
+              value={values.expense_date}
+              onChange={(event) => setValues((current) => ({ ...current, expense_date: event.target.value }))}
+            />
+          </label>
+          <label>
+            Recoverability
+            <select
+              value={values.recoverability}
+              onChange={(event) =>
+                setValues((current) => ({
+                  ...current,
+                  recoverability: event.target.value as 'recoverable' | 'non_recoverable',
+                }))}
+            >
+              <option value="recoverable">Potentially recoverable (manual review)</option>
+              <option value="non_recoverable">Non-recoverable</option>
+            </select>
+          </label>
+        </div>
+      </fieldset>
+      {fieldError ? <p className="lease-form-error" role="alert">{fieldError}</p> : null}
+      <div className="lease-form-actions">
+        <button className="bow-era-button" type="submit" disabled={saving}>
+          {saving ? 'Saving…' : isEdit ? 'Save expense changes' : 'Record expense'}
+        </button>
+        <button className="bow-era-button bow-era-button-secondary" type="button" onClick={onCancel} disabled={saving}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function PropertyExpensesPanel({
+  organizationId,
+  defaultCurrency,
+  canUpdate,
+}: {
+  organizationId: string;
+  defaultCurrency: Lease['currency'];
+  canUpdate: boolean;
+}) {
+  const [expenses, setExpenses] = useState<PropertyExpense[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [editingExpense, setEditingExpense] = useState<PropertyExpense | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      setExpenses(await fetchPropertyExpenses(organizationId));
+    } catch (reason) {
+      setError(propertyExpenseError(reason, 'Property expenses could not be loaded.').message);
+    } finally {
+      setLoading(false);
+    }
+  }, [organizationId]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function finishSave(saved: PropertyExpense): Promise<void> {
+    setSaving(true);
+    setError('');
+    try {
+      await refresh();
+      setEditingExpense(null);
+      setCreating(false);
+      setExpenses((current) => {
+        if (current.some((item) => item.id === saved.id)) return current;
+        return [saved, ...current];
+      });
+    } catch (reason) {
+      setError(propertyExpenseError(reason, 'Property expense updates could not be verified.').message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="lease-rent-schedules" aria-labelledby="property-expenses-heading">
+      <div className="lease-section-heading">
+        <h3 id="property-expenses-heading">Property expense register</h3>
+        {canUpdate && !creating && !editingExpense ? (
+          <button className="bow-era-button bow-era-button-secondary" type="button" onClick={() => setCreating(true)}>
+            Record property expense
+          </button>
+        ) : null}
+      </div>
+      <p className="lease-field-note">
+        Recoverable expenses are flagged for manual review. This register does not create tenant charge schedules, invoices or payment records automatically.
+      </p>
+      {loading ? <p role="status">Loading property expenses…</p> : null}
+      {error ? <p className="lease-form-error" role="alert">{error}</p> : null}
+      {!loading && expenses.length === 0 && !creating ? <p>No property expenses are recorded for this organisation.</p> : null}
+      {expenses.map((expense) => (
+        <article className="lease-rent-schedule" key={expense.id}>
+          <div className="lease-section-heading">
+            <h4>{expenseCategoryLabel(expense.category)} · {expense.recoverability.replaceAll('_', ' ')}</h4>
+            {canUpdate && !creating && !editingExpense ? (
+              <button className="bow-era-button bow-era-button-secondary" type="button" onClick={() => setEditingExpense(expense)} disabled={saving}>
+                Edit expense
+              </button>
+            ) : null}
+          </div>
+          <dl className="lease-detail-grid rent-schedule-grid">
+            <div><dt>Expense date</dt><dd>{formatDate(expense.expense_date)}</dd></div>
+            <div><dt>Amount</dt><dd>{expense.currency} {expense.amount}</dd></div>
+            <div><dt>Asset</dt><dd>{expenseAssetLabel(expense)}</dd></div>
+            <div><dt>Description</dt><dd>{expense.description}</dd></div>
+          </dl>
+          {expense.manual_review_reasons.length > 0 ? (
+            <p className="lease-form-error" role="note">
+              Manual review required: {expense.manual_review_reasons.map((reason) =>
+                reason === 'allocation_not_configured'
+                  ? 'allocation not configured'
+                  : 'recovery terms not verified').join(', ')}.
+            </p>
+          ) : null}
+          <ul className="lease-audit-list">
+            {expense.audit_events.map((event, index) => (
+              <li key={`${expense.id}-${event.occurred_at}-${index}`}>
+                <strong>{event.event_type === 'created' ? 'Expense recorded' : 'Expense updated'}</strong>
+                <time dateTime={event.occurred_at}>{formatTimestamp(event.occurred_at)}</time>
+                <span>Changed: {event.changed_fields.join(', ')}</span>
+              </li>
+            ))}
+          </ul>
+          {editingExpense?.id === expense.id ? (
+            <PropertyExpenseForm
+              organizationId={organizationId}
+              defaultCurrency={defaultCurrency}
+              expense={expense}
+              saving={saving}
+              onCancel={() => setEditingExpense(null)}
+              onSaved={(value) => { void finishSave(value); }}
+            />
+          ) : null}
+        </article>
+      ))}
+      {creating ? (
+        <PropertyExpenseForm
+          organizationId={organizationId}
+          defaultCurrency={defaultCurrency}
+          saving={saving}
+          onCancel={() => setCreating(false)}
+          onSaved={(value) => { void finishSave(value); }}
+        />
+      ) : null}
     </section>
   );
 }
@@ -1119,6 +1701,11 @@ function LeaseDetail({
         canUpdate={canUpdate}
         onLeaseUpdated={onLeaseUpdated}
       />
+      <PropertyExpensesPanel
+        organizationId={organizationId}
+        defaultCurrency={lease.currency}
+        canUpdate={canUpdate}
+      />
       <section aria-labelledby="lease-audit-heading">
         <h3 id="lease-audit-heading">Change history</h3>
         {lease.audit_events.length === 0 ? <p>No audit history is available.</p> : (
@@ -1130,11 +1717,11 @@ function LeaseDetail({
                     ? 'Lease recorded'
                     : event.event_type === 'updated'
                       ? 'Lease updated'
-                      : event.event_type === 'rent_schedule_created'
+                      : event.event_type === 'rent_schedule_created' || event.event_type === 'charge_created'
                         ? 'Rent schedule created'
-                        : event.event_type === 'rent_schedule_activated'
+                        : event.event_type === 'rent_schedule_activated' || event.event_type === 'charge_activated'
                           ? 'Rent schedule activated'
-                          : event.event_type === 'rent_schedule_generated'
+                          : event.event_type === 'rent_schedule_generated' || event.event_type === 'charge_generated'
                             ? 'Expected instalments generated'
                             : 'Rent schedule updated'}
                 </strong>

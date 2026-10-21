@@ -50,6 +50,7 @@ const rentSchedule = {
   organization_id: organizationId,
   lease_id: leaseId,
   charge_category: 'base_rent',
+  description: 'Base rent schedule',
   amount_per_period: '12500.50',
   currency: 'GBP',
   payment_frequency: 'monthly',
@@ -77,6 +78,32 @@ const rentSchedule = {
   ],
   created_at: '2026-04-01T10:00:00Z',
   updated_at: '2026-04-01T10:00:00Z',
+};
+const propertyExpense = {
+  id: '00000000-0000-4000-8000-000000000950',
+  organization_id: organizationId,
+  asset_level: 'unit',
+  portfolio_id: '00000000-0000-4000-8000-000000000201',
+  site_id: '00000000-0000-4000-8000-000000000301',
+  building_id: '00000000-0000-4000-8000-000000000401',
+  unit_id: '00000000-0000-4000-8000-000000000501',
+  category: 'maintenance',
+  description: 'Lift servicing',
+  amount: '250.00',
+  currency: 'GBP',
+  expense_date: '2026-05-20',
+  recoverability: 'recoverable',
+  manual_review_reasons: ['allocation_not_configured', 'recovery_terms_not_verified'],
+  audit_events: [
+    {
+      actor_id: '00000000-0000-4000-8000-000000000701',
+      event_type: 'created',
+      changed_fields: ['asset', 'amount'],
+      occurred_at: '2026-05-20T11:00:00Z',
+    },
+  ],
+  created_at: '2026-05-20T11:00:00Z',
+  updated_at: '2026-05-20T11:00:00Z',
 };
 
 function jsonResponse(status: number, payload: unknown): Response {
@@ -425,4 +452,106 @@ test('rent schedule generation requests are session authenticated and idempotenc
     401,
   );
   assert.equal(noSession.calls(), 0);
+});
+
+test('property expense endpoints enforce scope validation and forward write payloads', async () => {
+  const path = `/api/property-expenses?organizationId=${organizationId}`;
+  const listContext = setup({ payload: [propertyExpense] });
+  const listed = await listContext.handlers.listPropertyExpenses(listContext.request(path));
+  assert.equal(listed.status, 200);
+  assert.deepEqual(await listed.json(), [propertyExpense]);
+  assert.equal(
+    listContext.requestedUrl()?.href,
+    `https://lease-service.example.test/api/v1/organizations/${organizationId}/property-expenses?limit=50&offset=0`,
+  );
+
+  const writeContext = setup({ status: 201, payload: propertyExpense });
+  const createBody = {
+    idempotency_key: '00000000-0000-4000-8000-000000000951',
+    asset_level: 'unit',
+    portfolio_id: propertyExpense.portfolio_id,
+    site_id: propertyExpense.site_id,
+    building_id: propertyExpense.building_id,
+    unit_id: propertyExpense.unit_id,
+    category: 'maintenance',
+    description: 'Lift servicing',
+    amount: '250.00',
+    currency: 'GBP',
+    expense_date: '2026-05-20',
+    recoverability: 'recoverable',
+  };
+  const created = await writeContext.handlers.createPropertyExpense(
+    writeContext.request(path, 'POST', createBody),
+  );
+  assert.equal(created.status, 201);
+  assert.equal(JSON.parse(String(writeContext.requestInit()?.body)).amount, '250.00');
+
+  const detailPath = `/api/property-expenses/${propertyExpense.id}?organizationId=${organizationId}`;
+  const detailContext = setup({ payload: propertyExpense });
+  const detail = await detailContext.handlers.getPropertyExpense(
+    detailContext.request(detailPath),
+    propertyExpense.id,
+  );
+  assert.equal(detail.status, 200);
+  assert.deepEqual(await detail.json(), propertyExpense);
+
+  const updateContext = setup({ payload: { ...propertyExpense, amount: '300.25' } });
+  const updated = await updateContext.handlers.updatePropertyExpense(
+    updateContext.request(detailPath, 'PATCH', { amount: '300.25' }),
+    propertyExpense.id,
+  );
+  assert.equal(updated.status, 200);
+  assert.equal((await updated.json()).amount, '300.25');
+});
+
+test('property expense BFF rejects malformed updates and cross-organization payloads', async () => {
+  const path = `/api/property-expenses?organizationId=${organizationId}`;
+  const malformed = setup();
+  assert.equal(
+    (
+      await malformed.handlers.createPropertyExpense(
+        malformed.request(path, 'POST', {
+          idempotency_key: '00000000-0000-4000-8000-000000000952',
+          asset_level: 'unit',
+          portfolio_id: propertyExpense.portfolio_id,
+          site_id: propertyExpense.site_id,
+          building_id: propertyExpense.building_id,
+          unit_id: propertyExpense.unit_id,
+          category: 'maintenance',
+          description: 'x',
+          amount: '250.123',
+          currency: 'GBP',
+          expense_date: '2026-05-20',
+          recoverability: 'recoverable',
+        }),
+      )
+    ).status,
+    400,
+  );
+  assert.equal(malformed.calls(), 0);
+
+  const crossOrganization = setup({
+    payload: [{ ...propertyExpense, organization_id: '00000000-0000-4000-8000-000000000002' }],
+  });
+  assert.equal(
+    (
+      await crossOrganization.handlers.listPropertyExpenses(
+        crossOrganization.request(path),
+      )
+    ).status,
+    502,
+  );
+
+  const invalidUpdate = setup();
+  const detailPath = `/api/property-expenses/${propertyExpense.id}?organizationId=${organizationId}`;
+  assert.equal(
+    (
+      await invalidUpdate.handlers.updatePropertyExpense(
+        invalidUpdate.request(detailPath, 'PATCH', { amount: '1.234' }),
+        propertyExpense.id,
+      )
+    ).status,
+    400,
+  );
+  assert.equal(invalidUpdate.calls(), 0);
 });
