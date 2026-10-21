@@ -1,6 +1,6 @@
 # Local Microservices Development
 
-M0.2A adds a synchronous PostgreSQL connection and `/ready` check to the Organization & Access service. The Property & Asset Registry remains a health-only skeleton and does not connect to its database. Neither service currently persists domain data. No Cognito authentication, authorization, organisation isolation, event messaging, or AWS deployment is implemented. Do not use real customer data.
+Organization & Access and Property & Asset Registry have independent PostgreSQL databases. Lease Management adds a third database and validates Unit references through the authenticated Registry API. These local services are development foundations; do not use real customer data.
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ From the repository root:
 cp infra/local/.env.example infra/local/.env
 ```
 
-Set both database passwords in `infra/local/.env` before starting Compose. Generate local-only values, for example, with `openssl rand -hex 24`; do not commit `.env` or paste its values into logs. The checked-in example contains no credentials. Service and database host ports can be changed independently in this file.
+Set all three database passwords in `infra/local/.env` before starting Compose. To exercise authenticated Lease Management requests, configure the workload client values required by Cognito as well. Generate local-only values, for example, with `openssl rand -hex 24`; do not commit `.env` or paste its values into logs. The checked-in example contains no credentials. Service and database host ports can be changed independently in this file.
 
 ## Start services
 
@@ -40,15 +40,23 @@ docker compose --env-file infra/local/.env -f infra/local/compose.yaml up --buil
 
 The default health URLs are `http://localhost:8101/health` and `http://localhost:8102/health`. Organization & Access readiness, including its PostgreSQL connectivity check, is at `http://localhost:8101/ready`. Default PostgreSQL host ports are 55431 and 55432. Database ports bind to loopback only. Each service has its own database container, user, database name, and named volume.
 
+Lease Management is available at `http://localhost:8103`; its readiness check is `http://localhost:8103/ready`. Its PostgreSQL port defaults to 55433 and uses a separate named volume. To start it with its own database and its service dependencies:
+
+```bash
+docker compose --env-file infra/local/.env -f infra/local/compose.yaml up --build lease-management
+```
+
+The local Compose network enables HTTP only for internal service-to-service calls. Production configurations must use HTTPS and properly scoped workload credentials.
+
 ## Stop services and data
 
-Stop containers and remove the Compose network while retaining database volumes:
+Stop containers and remove the Compose network while retaining all database volumes:
 
 ```bash
 docker compose --env-file infra/local/.env -f infra/local/compose.yaml down
 ```
 
-To stop one service and its database, use `docker compose ... stop organization-access` or `stop property-assets`. Do not add `-v` to `down` unless you explicitly intend to permanently remove both local database volumes and their data.
+To stop one service and its database, use `docker compose ... stop organization-access`, `stop property-assets`, or `stop lease-management`. Do not add `-v` to `down` unless you explicitly intend to permanently remove local database volumes and their data.
 
 ## Test service skeletons
 
@@ -64,6 +72,8 @@ pytest -q
 
 Run the equivalent commands from `services/property-assets`. Tests use FastAPI's test client. Organization & Access database checks use SQLite and simulated connection failure, so its tests do not require Docker or PostgreSQL.
 
+Lease Management tests run from `services/lease-management` with its `requirements-dev.txt`. They use SQLite and mock the Organization & Access and Registry boundaries; no live tokens, services, or Docker are required.
+
 ## Run a service without Compose
 
 From the respective service directory, install its runtime dependencies in a local virtual environment, then run:
@@ -72,7 +82,7 @@ From the respective service directory, install its runtime dependencies in a loc
 SERVICE_PORT=8101 uvicorn app.main:app --host 127.0.0.1 --port 8101
 ```
 
-Use a different `SERVICE_PORT` and `--port` for the property-assets service (default 8102). The Organization & Access service can start without PostgreSQL, but `/ready` returns `503` until its configured database is reachable. Its `/health` endpoint remains independent of PostgreSQL. The Property & Asset Registry service remains health-only and does not open database connections.
+Use a different `SERVICE_PORT` and `--port` for the Property & Asset Registry (default 8102) or Lease Management (default 8103). `/health` is an application liveness check; `/ready` requires the service's own configured database. Lease API operations also require valid workload credentials and reachable Organization & Access and Property & Asset Registry APIs. Unit deactivation checks active or draft lease references through Lease Management and fails closed when that service is unavailable. Lease Management's Alembic migration must be run manually against a developer-controlled database; Compose does not apply migrations automatically.
 
 ## Existing Phase 2 application
 

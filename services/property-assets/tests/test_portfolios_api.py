@@ -4,16 +4,15 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy.exc import OperationalError
-
-from app import authorization, config
 from app.authorization import (
     get_authorization_workload_token,
 )
 from app.main import app, get_portfolio_session
 from app.workload_token import WorkloadTokenError
+from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 
+from app import authorization, config
 
 ORGANIZATION_ID = uuid4()
 ACTOR_ID = uuid4()
@@ -520,3 +519,15 @@ def test_internal_service_url_must_be_secure_or_explicit_loopback(
 
     assert response.status_code == 503
     assert session.statements == []
+
+
+def test_compose_service_dns_is_allowed_only_for_local_internal_http(monkeypatch):
+    monkeypatch.setattr(config, "ORGANIZATION_ACCESS_URL", "http://organization-access:8101")
+    monkeypatch.setattr(config, "ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP", True)
+    assert authorization._decision_url() == (
+        "http://organization-access:8101" + DECISION_PATH
+    )
+
+    monkeypatch.setattr(config, "ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP", False)
+    with pytest.raises(authorization.AuthorizationDependencyUnavailable):
+        authorization._decision_url()

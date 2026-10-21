@@ -33,12 +33,34 @@ services:
       timeout: 5s
       retries: 10
 
+  lease-management-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${LEASE_MANAGEMENT_DB_NAME:-bowera_lease_management}
+      POSTGRES_USER: ${LEASE_MANAGEMENT_DB_USER:-bowera_lease_management}
+      POSTGRES_PASSWORD: ${LEASE_MANAGEMENT_DB_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${LEASE_MANAGEMENT_DB_PORT:-55433}:5432"
+    volumes:
+      - lease-management-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   organization-access:
     build:
       context: ../../services/organization-access
     environment:
       SERVICE_PORT: ${ORG_ACCESS_PORT:-8101}
       DATABASE_URL: postgresql+psycopg://${ORG_ACCESS_DB_USER}:${ORG_ACCESS_DB_PASSWORD}@organization-access-db:5432/${ORG_ACCESS_DB_NAME}
+      COGNITO_ISSUER: ${COGNITO_ISSUER:-}
+      COGNITO_USER_POOL_REGION: ${COGNITO_USER_POOL_REGION:-}
+      COGNITO_APP_CLIENT_ID: ${COGNITO_APP_CLIENT_ID:-}
+      COGNITO_REQUIRED_SCOPE: ${COGNITO_REQUIRED_SCOPE:-}
+      COGNITO_WORKLOAD_CLIENT_ID: ${COGNITO_WORKLOAD_CLIENT_ID:-}
+      COGNITO_WORKLOAD_REQUIRED_SCOPE: ${COGNITO_WORKLOAD_REQUIRED_SCOPE:-}
     ports:
       - "127.0.0.1:${ORG_ACCESS_PORT:-8101}:${ORG_ACCESS_PORT:-8101}"
     depends_on:
@@ -61,10 +83,56 @@ services:
     environment:
       SERVICE_PORT: ${PROPERTY_ASSETS_PORT:-8102}
       DATABASE_URL: postgresql+psycopg://${PROPERTY_ASSETS_DB_USER}:${PROPERTY_ASSETS_DB_PASSWORD}@property-assets-db:5432/${PROPERTY_ASSETS_DB_NAME}
+      COGNITO_TOKEN_ENDPOINT_URL: ${COGNITO_TOKEN_ENDPOINT_URL:-}
+      COGNITO_WORKLOAD_CLIENT_ID: ${COGNITO_WORKLOAD_CLIENT_ID:-}
+      COGNITO_WORKLOAD_CLIENT_SECRET: ${COGNITO_WORKLOAD_CLIENT_SECRET:-}
+      COGNITO_WORKLOAD_REQUIRED_SCOPE: ${COGNITO_WORKLOAD_REQUIRED_SCOPE:-}
+      COGNITO_ALLOW_INSECURE_TOKEN_ENDPOINT: ${COGNITO_ALLOW_INSECURE_TOKEN_ENDPOINT:-false}
+      ORGANIZATION_ACCESS_URL: http://organization-access:8101
+      ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP: "true"
+      LEASE_MANAGEMENT_URL: http://lease-management:8103
+      LEASE_MANAGEMENT_ALLOW_INSECURE_LOCAL_HTTP: "true"
     ports:
       - "127.0.0.1:${PROPERTY_ASSETS_PORT:-8102}:${PROPERTY_ASSETS_PORT:-8102}"
     depends_on:
       property-assets-db:
+        condition: service_healthy
+      organization-access:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['SERVICE_PORT'] + '/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  lease-management:
+    build:
+      context: ../../services/lease-management
+    environment:
+      SERVICE_PORT: ${LEASE_MANAGEMENT_PORT:-8103}
+      DATABASE_URL: postgresql+psycopg://${LEASE_MANAGEMENT_DB_USER:-bowera_lease_management}:${LEASE_MANAGEMENT_DB_PASSWORD:-}@lease-management-db:5432/${LEASE_MANAGEMENT_DB_NAME:-bowera_lease_management}
+      ORGANIZATION_ACCESS_URL: http://organization-access:8101
+      PROPERTY_ASSETS_REGISTRY_URL: http://property-assets:8102
+      COGNITO_TOKEN_ENDPOINT_URL: ${COGNITO_TOKEN_ENDPOINT_URL:-}
+      COGNITO_WORKLOAD_CLIENT_ID: ${COGNITO_WORKLOAD_CLIENT_ID:-}
+      COGNITO_WORKLOAD_CLIENT_SECRET: ${COGNITO_WORKLOAD_CLIENT_SECRET:-}
+      COGNITO_WORKLOAD_REQUIRED_SCOPE: ${COGNITO_WORKLOAD_REQUIRED_SCOPE:-}
+      COGNITO_ALLOW_INSECURE_TOKEN_ENDPOINT: ${COGNITO_ALLOW_INSECURE_TOKEN_ENDPOINT:-false}
+      ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP: "true"
+      PROPERTY_ASSETS_ALLOW_INSECURE_LOCAL_HTTP: "true"
+    ports:
+      - "127.0.0.1:${LEASE_MANAGEMENT_PORT:-8103}:${LEASE_MANAGEMENT_PORT:-8103}"
+    depends_on:
+      lease-management-db:
+        condition: service_healthy
+      organization-access:
+        condition: service_healthy
+      property-assets:
         condition: service_healthy
     healthcheck:
       test:
@@ -80,3 +148,4 @@ services:
 volumes:
   organization-access-data:
   property-assets-data:
+  lease-management-data:

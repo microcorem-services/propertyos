@@ -2,9 +2,8 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
-
 from app.models import MembershipRole, MembershipStatus, OrganizationStatus
+from pydantic import BaseModel, ConfigDict
 
 
 class APIResponse(BaseModel):
@@ -67,6 +66,9 @@ class InternalAuthorizationDecisionRequest(BaseModel):
         "property-assets.buildings.update",
         "property-assets.units.create",
         "property-assets.units.update",
+        "lease-management.leases.read",
+        "lease-management.leases.create",
+        "lease-management.leases.update",
     ]
 
 
@@ -82,6 +84,9 @@ class InternalAuthorizationDecisionResponse(BaseModel):
         "property-assets.buildings.update",
         "property-assets.units.create",
         "property-assets.units.update",
+        "lease-management.leases.read",
+        "lease-management.leases.create",
+        "lease-management.leases.update",
     ]
     allowed: Literal[True]
     actor_id: UUID

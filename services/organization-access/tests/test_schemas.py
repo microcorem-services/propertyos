@@ -2,18 +2,23 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
-
-from app.main import API_V1_PREFIX, api_router, app
+from app.main import (
+    API_V1_PREFIX,
+    api_router,
+    app,
+    permitted_roles_for_operation,
+)
 from app.models import MembershipRole, MembershipStatus, OrganizationStatus
 from app.schemas import (
     APIErrorResponse,
+    InternalAuthorizationDecisionRequest,
     MembershipResponse,
     OrganizationChooserItemResponse,
     OrganizationChooserPageResponse,
     OrganizationResponse,
     UserResponse,
 )
+from pydantic import ValidationError
 
 
 def test_organization_response_validates_model_attributes():
@@ -132,6 +137,36 @@ def test_api_error_response_has_consistent_envelope():
     assert response.model_dump() == {
         "error": {"code": "not_found", "message": "Resource not found"}
     }
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_roles"),
+    [
+        ("lease-management.leases.read", None),
+        (
+            "lease-management.leases.create",
+            {MembershipRole.OWNER, MembershipRole.ADMIN},
+        ),
+        (
+            "lease-management.leases.update",
+            {MembershipRole.OWNER, MembershipRole.ADMIN},
+        ),
+    ],
+)
+def test_lease_authorization_operations_are_allowlisted_with_existing_role_rules(
+    operation, expected_roles
+):
+    assert InternalAuthorizationDecisionRequest(
+        organization_id=uuid4(), operation=operation
+    ).operation == operation
+    assert permitted_roles_for_operation(operation) == expected_roles
+
+
+def test_internal_authorization_rejects_unlisted_operations():
+    with pytest.raises(ValidationError):
+        InternalAuthorizationDecisionRequest(
+            organization_id=uuid4(), operation="lease-management.leases.delete"
+        )
 
 
 def test_my_organizations_route_is_registered_under_versioned_api():

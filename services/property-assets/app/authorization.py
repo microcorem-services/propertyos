@@ -1,18 +1,17 @@
-from dataclasses import dataclass
 import ipaddress
 import json
 import math
 import re
+from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
+from app.workload_token import WorkloadTokenError, get_workload_access_token
 from fastapi import Depends, Query, Request
 
 from app import config
-from app.workload_token import WorkloadTokenError, get_workload_access_token
-
 
 AuthorizationOperation = Literal[
     "property-assets.portfolios.read",
@@ -57,6 +56,14 @@ class OrganizationAccessDenied(Exception):
 
 
 class AuthorizationDependencyUnavailable(Exception):
+    pass
+
+
+class LeaseManagementDependencyUnavailable(Exception):
+    pass
+
+
+class UnitHasActiveLease(Exception):
     pass
 
 
@@ -138,14 +145,17 @@ def _decision_url() -> str:
         raise AuthorizationDependencyUnavailable
     if parsed.scheme == "https":
         return f"{service_url.rstrip('/')}{DECISION_PATH}"
-    if parsed.scheme != "http" or not config.ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP:
+    if (
+        parsed.scheme != "http"
+        or not config.ORGANIZATION_ACCESS_ALLOW_INSECURE_LOCAL_HTTP
+    ):
         raise AuthorizationDependencyUnavailable
 
     try:
         is_loopback = ipaddress.ip_address(hostname).is_loopback
     except ValueError:
         is_loopback = hostname.lower() == "localhost"
-    if not is_loopback:
+    if not is_loopback and hostname.lower() != "organization-access":
         raise AuthorizationDependencyUnavailable
     return f"{service_url.rstrip('/')}{DECISION_PATH}"
 
@@ -228,6 +238,106 @@ def get_authorization_workload_token() -> str:
         return get_workload_access_token()
     except WorkloadTokenError:
         raise AuthorizationDependencyUnavailable from None
+
+
+def ensure_unit_can_be_deactivated(
+    organization_id: UUID,
+    unit_id: UUID,
+    user_token: str,
+    workload_token: str,
+) -> None:
+    try:
+        connect_timeout = float(config.LEASE_MANAGEMENT_CONNECT_TIMEOUT_SECONDS)
+        read_timeout = float(config.LEASE_MANAGEMENT_READ_TIMEOUT_SECONDS)
+        parsed = urlsplit(config.LEASE_MANAGEMENT_URL)
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        raise LeaseManagementDependencyUnavailable from None
+    if (
+        not math.isfinite(connect_timeout)
+        or connect_timeout <= 0
+        or not math.isfinite(read_timeout)
+        or read_timeout <= 0
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise LeaseManagementDependencyUnavailable
+    if parsed.scheme == "https":
+        base_url = config.LEASE_MANAGEMENT_URL.rstrip("/")
+    elif (
+        parsed.scheme == "http"
+        and config.LEASE_MANAGEMENT_ALLOW_INSECURE_LOCAL_HTTP
+        and hostname.lower() == "lease-management"
+    ):
+        base_url = config.LEASE_MANAGEMENT_URL.rstrip("/")
+    elif (
+        parsed.scheme == "http"
+        and config.LEASE_MANAGEMENT_ALLOW_INSECURE_LOCAL_HTTP
+    ):
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = hostname.lower() == "localhost"
+        if not loopback:
+            raise LeaseManagementDependencyUnavailable
+        base_url = config.LEASE_MANAGEMENT_URL.rstrip("/")
+    else:
+        raise LeaseManagementDependencyUnavailable
+
+    path = (
+        f"/internal/v1/organizations/{organization_id}"
+        f"/units/{unit_id}/retirement-check"
+    )
+    try:
+        response = httpx.get(
+            f"{base_url}{path}",
+            params={"organization_id": str(organization_id)},
+            headers={
+                "Authorization": f"Bearer {user_token}",
+                "X-Service-Authorization": f"Bearer {workload_token}",
+                "Accept": "application/json",
+            },
+            timeout=httpx.Timeout(
+                connect=connect_timeout,
+                read=read_timeout,
+                write=read_timeout,
+                pool=connect_timeout,
+            ),
+            follow_redirects=False,
+        )
+    except (httpx.HTTPError, ValueError):
+        raise LeaseManagementDependencyUnavailable from None
+
+    if response.status_code == 401:
+        raise UserAuthenticationRequired
+    if response.status_code == 403:
+        raise OrganizationAccessDenied
+    if response.status_code != 200:
+        raise LeaseManagementDependencyUnavailable
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict) or set(payload) != {
+            "organization_id",
+            "unit_id",
+            "referenced",
+        }:
+            raise ValueError
+        response_organization_id = UUID(payload["organization_id"])
+        response_unit_id = UUID(payload["unit_id"])
+    except (json.JSONDecodeError, UnicodeError, ValueError, TypeError):
+        raise LeaseManagementDependencyUnavailable from None
+    if (
+        response_organization_id != organization_id
+        or response_unit_id != unit_id
+        or type(payload["referenced"]) is not bool
+    ):
+        raise LeaseManagementDependencyUnavailable
+    if payload["referenced"]:
+        raise UnitHasActiveLease
 
 
 def get_authorized_organization(

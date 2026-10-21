@@ -2,27 +2,22 @@ from collections.abc import Generator
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from sqlalchemy import and_, select
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
-
-from app import database
 from app.authorization import (
-    AuthorizationDependencyUnavailable,
-    AuthorizedOrganization,
     CREATE_BUILDING_OPERATION,
     CREATE_OPERATION,
     CREATE_SITE_OPERATION,
     CREATE_UNIT_OPERATION,
-    OrganizationAccessDenied,
-    UPDATE_OPERATION,
     UPDATE_BUILDING_OPERATION,
+    UPDATE_OPERATION,
     UPDATE_SITE_OPERATION,
     UPDATE_UNIT_OPERATION,
+    AuthorizationDependencyUnavailable,
+    AuthorizedOrganization,
+    LeaseManagementDependencyUnavailable,
+    OrganizationAccessDenied,
+    UnitHasActiveLease,
     UserAuthenticationRequired,
+    ensure_unit_can_be_deactivated,
     get_authorization_workload_token,
     get_authorized_organization,
     get_building_write_permissions,
@@ -34,8 +29,8 @@ from app.authorization import (
 )
 from app.config import SERVICE_NAME
 from app.models import (
-    BuildingAuditEvent,
     Building,
+    BuildingAuditEvent,
     Portfolio,
     PortfolioAuditEvent,
     Site,
@@ -44,16 +39,16 @@ from app.models import (
     UnitAuditEvent,
 )
 from app.schemas import (
-    BuildingUpdateRequest,
     BuildingResponse,
+    BuildingUpdateRequest,
     BuildingWritePermissionsResponse,
     BuildingWriteRequest,
     PortfolioResponse,
     PortfolioUpdateRequest,
     PortfolioWritePermissionsResponse,
     PortfolioWriteRequest,
-    SiteUpdateRequest,
     SiteResponse,
+    SiteUpdateRequest,
     SiteWritePermissionsResponse,
     SiteWriteRequest,
     UnitResponse,
@@ -61,6 +56,14 @@ from app.schemas import (
     UnitWritePermissionsResponse,
     UnitWriteRequest,
 )
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from sqlalchemy import and_, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app import database
 
 app = FastAPI(title="BOWERA Property & Asset Registry", version="0.1.0")
 api_router = APIRouter(prefix="/api/v1")
@@ -658,6 +661,8 @@ def update_unit(
     building_id: UUID,
     payload: UnitUpdateRequest,
     _authorization: AuthorizedOrganization = Depends(_update_unit_authorization),
+    user_token: str = Depends(get_user_bearer_token),
+    workload_token: str = Depends(get_authorization_workload_token),
     session: Session = Depends(get_portfolio_session),
 ) -> Unit:
     updates = payload.model_dump(exclude_unset=True)
@@ -708,6 +713,26 @@ def update_unit(
                 for field, value in updates.items()
                 if value != getattr(unit, field)
             )
+            if unit.status == "active" and updates.get("status") == "inactive":
+                try:
+                    ensure_unit_can_be_deactivated(
+                        _authorization.organization_id,
+                        unit.id,
+                        user_token,
+                        workload_token,
+                    )
+                except UnitHasActiveLease:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Unit is referenced by a lease and cannot be deactivated"
+                        ),
+                    ) from None
+                except LeaseManagementDependencyUnavailable:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Lease Management service unavailable",
+                    ) from None
             for field, value in updates.items():
                 setattr(unit, field, value)
             unit.updated_at = datetime.now(UTC)

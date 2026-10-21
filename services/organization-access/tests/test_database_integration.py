@@ -10,17 +10,6 @@ from pathlib import Path
 
 import jwt
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import Depends, FastAPI
-from fastapi.testclient import TestClient
-from jwt import PyJWKClient
-from sqlalchemy import create_engine, select, text
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
-
-from app import auth, config
-from app import database
 from app.auth import AuthenticatedPrincipal, verify_access_token
 from app.authorization import (
     AuthorizationDenied,
@@ -30,10 +19,10 @@ from app.authorization import (
     require_organization_membership,
 )
 from app.main import (
+    _organization_membership_dependency,
     app,
     authorization_denied_handler,
     authorization_service_unavailable_handler,
-    _organization_membership_dependency,
 )
 from app.models import (
     Membership,
@@ -43,7 +32,16 @@ from app.models import (
     OrganizationStatus,
     User,
 )
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from jwt import PyJWKClient
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import URL, Engine
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
 
+from app import auth, config, database
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = SERVICE_ROOT.parents[1]
@@ -927,6 +925,13 @@ def test_internal_decision_requires_active_member_and_both_credentials(
         ("property-assets.units.update", MembershipRole.ADMIN, 200),
         ("property-assets.units.create", MembershipRole.OWNER, 200),
         ("property-assets.units.update", MembershipRole.OWNER, 200),
+        ("lease-management.leases.read", MembershipRole.MEMBER, 200),
+        ("lease-management.leases.create", MembershipRole.MEMBER, 403),
+        ("lease-management.leases.update", MembershipRole.MEMBER, 403),
+        ("lease-management.leases.create", MembershipRole.ADMIN, 200),
+        ("lease-management.leases.update", MembershipRole.ADMIN, 200),
+        ("lease-management.leases.create", MembershipRole.OWNER, 200),
+        ("lease-management.leases.update", MembershipRole.OWNER, 200),
     ],
 )
 def test_internal_portfolio_operations_enforce_membership_roles(

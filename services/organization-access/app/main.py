@@ -1,12 +1,5 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
-from sqlalchemy import select, text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
-
-from app import database
 from app.auth import (
     AuthenticatedPrincipal,
     AuthenticatedWorkload,
@@ -33,6 +26,13 @@ from app.schemas import (
     OrganizationChooserPageResponse,
     OrganizationResponse,
 )
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app import database
 
 API_V1_PREFIX = "/api/v1"
 _organization_membership_dependency = require_organization_membership()
@@ -111,6 +111,14 @@ def readiness():
     return {"status": "ok", "service": SERVICE_NAME}
 
 
+def permitted_roles_for_operation(
+    operation: str,
+) -> set[MembershipRole] | None:
+    if operation.endswith(".read"):
+        return None
+    return {MembershipRole.OWNER, MembershipRole.ADMIN}
+
+
 @api_router.get(
     "/organizations/{organization_id}",
     response_model=OrganizationResponse,
@@ -184,16 +192,11 @@ def decide_internal_authorization(
     principal: AuthenticatedPrincipal = Depends(verify_access_token),
     session: Session = Depends(get_authorization_session),
 ) -> InternalAuthorizationDecisionResponse:
-    permitted_roles = (
-        None
-        if decision.operation == "property-assets.portfolios.read"
-        else {MembershipRole.OWNER, MembershipRole.ADMIN}
-    )
     authorized = authorize_organization_membership(
         decision.organization_id,
         principal,
         session,
-        permitted_roles=permitted_roles,
+        permitted_roles=permitted_roles_for_operation(decision.operation),
     )
     return InternalAuthorizationDecisionResponse(
         organization_id=authorized.organization_id,

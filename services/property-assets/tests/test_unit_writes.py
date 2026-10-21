@@ -5,10 +5,6 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy.exc import OperationalError
-
-from app import authorization, config
 from app.authorization import get_authorization_workload_token
 from app.main import app, get_portfolio_session
 from app.models import (
@@ -18,6 +14,11 @@ from app.models import (
     Unit,
     UnitAuditEvent,
 )
+from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
+
+from app import authorization, config
+from app import main as property_main
 
 ORGANIZATION_ID = uuid4()
 OTHER_ORGANIZATION_ID = uuid4()
@@ -284,6 +285,187 @@ def test_unit_update_is_scoped_and_audited(monkeypatch):
     assert len(session.audit_events) == 1
     assert session.audit_events[0].changed_fields == ["area_sqm", "name"]
     assert session.audit_events[0].operation == "property-assets.units.update"
+
+
+def test_referenced_unit_cannot_be_deactivated(monkeypatch):
+    unit = existing_unit()
+    client, session = make_client(monkeypatch, unit=unit)
+    monkeypatch.setattr(
+        authorization.httpx,
+        "post",
+        lambda url, **kwargs: valid_decision(kwargs["json"]["operation"]),
+    )
+    retirement_checks = []
+
+    def referenced(*args):
+        retirement_checks.append(args)
+        raise authorization.UnitHasActiveLease
+
+    monkeypatch.setattr(
+        property_main,
+        "ensure_unit_can_be_deactivated",
+        referenced,
+    )
+
+    response = client.patch(
+        f"/api/v1/units/{UNIT_ID}",
+        params=parent_params(),
+        headers=request_headers(),
+        json={"status": "inactive"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == (
+        "Unit is referenced by a lease and cannot be deactivated"
+    )
+    assert unit.status == "active"
+    assert session.audit_events == []
+    assert retirement_checks == [
+        (ORGANIZATION_ID, UNIT_ID, USER_TOKEN, WORKLOAD_TOKEN)
+    ]
+
+
+def test_unreferenced_unit_can_be_deactivated_and_audited(monkeypatch):
+    unit = existing_unit()
+    client, session = make_client(monkeypatch, unit=unit)
+    monkeypatch.setattr(
+        authorization.httpx,
+        "post",
+        lambda url, **kwargs: valid_decision(kwargs["json"]["operation"]),
+    )
+    checked = []
+    monkeypatch.setattr(
+        property_main,
+        "ensure_unit_can_be_deactivated",
+        lambda *args: checked.append(args),
+    )
+
+    response = client.patch(
+        f"/api/v1/units/{UNIT_ID}",
+        params=parent_params(),
+        headers=request_headers(),
+        json={"status": "inactive"},
+    )
+
+    assert response.status_code == 200
+    assert unit.status == "inactive"
+    assert checked == [(ORGANIZATION_ID, UNIT_ID, USER_TOKEN, WORKLOAD_TOKEN)]
+    assert session.audit_events[0].changed_fields == ["status"]
+
+
+def test_lease_management_outage_blocks_unit_deactivation(monkeypatch):
+    unit = existing_unit()
+    client, session = make_client(monkeypatch, unit=unit)
+    monkeypatch.setattr(
+        authorization.httpx,
+        "post",
+        lambda url, **kwargs: valid_decision(kwargs["json"]["operation"]),
+    )
+    monkeypatch.setattr(
+        property_main,
+        "ensure_unit_can_be_deactivated",
+        lambda *_args: (_ for _ in ()).throw(
+            authorization.LeaseManagementDependencyUnavailable
+        ),
+    )
+
+    response = client.patch(
+        f"/api/v1/units/{UNIT_ID}",
+        params=parent_params(),
+        headers=request_headers(),
+        json={"status": "inactive"},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "Lease Management service unavailable"
+    assert unit.status == "active"
+    assert session.audit_events == []
+
+
+def test_retirement_check_client_sends_both_credentials_and_validates_result(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        config, "LEASE_MANAGEMENT_URL", "https://lease-management.example.test"
+    )
+    responses = []
+
+    def available(url, **kwargs):
+        responses.append((url, kwargs))
+        return httpx.Response(
+            200,
+            json={
+                "organization_id": str(ORGANIZATION_ID),
+                "unit_id": str(UNIT_ID),
+                "referenced": False,
+            },
+        )
+
+    monkeypatch.setattr(authorization.httpx, "get", available)
+    authorization.ensure_unit_can_be_deactivated(
+        ORGANIZATION_ID, UNIT_ID, USER_TOKEN, WORKLOAD_TOKEN
+    )
+    url, kwargs = responses[0]
+    assert url.endswith(
+        f"/internal/v1/organizations/{ORGANIZATION_ID}/units/{UNIT_ID}/retirement-check"
+    )
+    assert kwargs["params"] == {"organization_id": str(ORGANIZATION_ID)}
+    assert kwargs["headers"]["Authorization"] == f"Bearer {USER_TOKEN}"
+    assert kwargs["headers"]["X-Service-Authorization"] == (
+        f"Bearer {WORKLOAD_TOKEN}"
+    )
+    assert kwargs["follow_redirects"] is False
+
+
+def test_retirement_check_client_fails_closed_on_wrong_identity_or_service_error(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        config, "LEASE_MANAGEMENT_URL", "https://lease-management.example.test"
+    )
+    monkeypatch.setattr(
+        authorization.httpx,
+        "get",
+        lambda *_args, **_kwargs: httpx.Response(
+            200,
+            json={
+                "organization_id": str(OTHER_ORGANIZATION_ID),
+                "unit_id": str(UNIT_ID),
+                "referenced": False,
+            },
+        ),
+    )
+    with pytest.raises(authorization.LeaseManagementDependencyUnavailable):
+        authorization.ensure_unit_can_be_deactivated(
+            ORGANIZATION_ID, UNIT_ID, USER_TOKEN, WORKLOAD_TOKEN
+        )
+
+    monkeypatch.setattr(
+        authorization.httpx,
+        "get",
+        lambda *_args, **_kwargs: httpx.Response(
+            200,
+            json={
+                "organization_id": str(ORGANIZATION_ID),
+                "unit_id": str(UNIT_ID),
+                "referenced": True,
+            },
+        ),
+    )
+    with pytest.raises(authorization.UnitHasActiveLease):
+        authorization.ensure_unit_can_be_deactivated(
+            ORGANIZATION_ID, UNIT_ID, USER_TOKEN, WORKLOAD_TOKEN
+        )
+
+    monkeypatch.setattr(
+        authorization.httpx,
+        "get",
+        lambda *_args, **_kwargs: httpx.Response(503),
+    )
+    with pytest.raises(authorization.LeaseManagementDependencyUnavailable):
+        authorization.ensure_unit_can_be_deactivated(
+            ORGANIZATION_ID, UNIT_ID, USER_TOKEN, WORKLOAD_TOKEN
+        )
 
 
 def test_unit_writes_reject_denial_wrong_parent_and_protected_fields(monkeypatch):
