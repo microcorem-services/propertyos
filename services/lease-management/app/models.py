@@ -319,6 +319,9 @@ class RentInstallment(Base):
             "due_date",
             name="uq_rent_installments_schedule_due_date",
         ),
+        UniqueConstraint(
+            "id", "organization_id", name="uq_rent_installments_id_organization"
+        ),
         CheckConstraint("amount > 0", name="ck_rent_installments_amount_positive"),
         CheckConstraint(
             "currency IN ('GBP', 'EUR', 'USD')",
@@ -467,3 +470,247 @@ class PropertyExpenseAuditEvent(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     expense: Mapped[PropertyExpense] = relationship(back_populates="audit_events")
+
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["lease_id", "organization_id"],
+            ["leases.id", "leases.organization_id"],
+            name="fk_invoices_lease_organization",
+        ),
+        UniqueConstraint("id", "organization_id", name="uq_invoices_id_organization"),
+        UniqueConstraint(
+            "organization_id", "invoice_number", name="uq_invoices_organization_number"
+        ),
+        CheckConstraint(
+            "length(trim(invoice_number)) > 0", name="ck_invoices_number"
+        ),
+        CheckConstraint(
+            "currency IN ('GBP', 'EUR', 'USD')", name="ck_invoices_currency"
+        ),
+        CheckConstraint("due_date >= issue_date", name="ck_invoices_dates"),
+        CheckConstraint(
+            "status IN ('draft', 'issued')", name="ck_invoices_status"
+        ),
+        CheckConstraint("subtotal >= 0 AND total >= 0", name="ck_invoices_totals"),
+        Index("ix_invoices_organization_status_due", "organization_id", "status", "due_date"),
+        Index("ix_invoices_organization_lease", "organization_id", "lease_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    lease_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    invoice_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    issue_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    subtotal: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    total: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    lines: Mapped[list["InvoiceLine"]] = relationship(
+        back_populates="invoice", cascade="all, delete-orphan"
+    )
+    audit_events: Mapped[list["InvoiceAuditEvent"]] = relationship(
+        back_populates="invoice", cascade="all, delete-orphan"
+    )
+    allocations: Mapped[list["PaymentAllocation"]] = relationship(
+        back_populates="invoice", overlaps="payment,allocations"
+    )
+
+
+class InvoiceLine(Base):
+    __tablename__ = "invoice_lines"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["invoice_id", "organization_id"],
+            ["invoices.id", "invoices.organization_id"],
+            name="fk_invoice_lines_invoice_organization",
+        ),
+        ForeignKeyConstraint(
+            ["source_installment_id", "organization_id"],
+            ["rent_installments.id", "rent_installments.organization_id"],
+            name="fk_invoice_lines_installment_organization",
+        ),
+        UniqueConstraint(
+            "source_installment_id", name="uq_invoice_lines_source_installment"
+        ),
+        CheckConstraint("length(trim(description)) > 0", name="ck_invoice_lines_description"),
+        CheckConstraint("quantity > 0", name="ck_invoice_lines_quantity"),
+        CheckConstraint("unit_amount >= 0", name="ck_invoice_lines_unit_amount"),
+        CheckConstraint("line_total >= 0", name="ck_invoice_lines_total"),
+        Index("ix_invoice_lines_organization_invoice", "organization_id", "invoice_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    invoice_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    source_installment_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    description: Mapped[str] = mapped_column(String(250), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
+    unit_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    line_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    invoice: Mapped[Invoice] = relationship(back_populates="lines")
+
+
+class InvoiceAuditEvent(Base):
+    __tablename__ = "invoice_audit_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["invoice_id", "organization_id"],
+            ["invoices.id", "invoices.organization_id"],
+            name="fk_invoice_audit_invoice_organization",
+        ),
+        CheckConstraint(
+            "event_type IN ('created', 'updated', 'issued')",
+            name="ck_invoice_audit_event_type",
+        ),
+        Index(
+            "ix_invoice_audit_organization_invoice_occurred",
+            "organization_id",
+            "invoice_id",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    invoice_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    invoice: Mapped[Invoice] = relationship(back_populates="audit_events")
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_payments_id_organization"),
+        UniqueConstraint(
+            "organization_id", "idempotency_key", name="uq_payments_idempotency"
+        ),
+        CheckConstraint("length(trim(reference)) > 0", name="ck_payments_reference"),
+        CheckConstraint(
+            "length(trim(method_description)) > 0", name="ck_payments_method"
+        ),
+        CheckConstraint("amount > 0", name="ck_payments_amount"),
+        CheckConstraint(
+            "currency IN ('GBP', 'EUR', 'USD')", name="ck_payments_currency"
+        ),
+        Index("ix_payments_organization_received", "organization_id", "received_on"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    idempotency_key: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    reference: Mapped[str] = mapped_column(String(100), nullable=False)
+    received_on: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    method_description: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    allocations: Mapped[list["PaymentAllocation"]] = relationship(
+        back_populates="payment",
+        cascade="all, delete-orphan",
+        overlaps="invoice,allocations",
+    )
+    audit_events: Mapped[list["PaymentAuditEvent"]] = relationship(
+        back_populates="payment", cascade="all, delete-orphan"
+    )
+
+
+class PaymentAllocation(Base):
+    __tablename__ = "payment_allocations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["payment_id", "organization_id"],
+            ["payments.id", "payments.organization_id"],
+            name="fk_payment_allocations_payment_organization",
+        ),
+        ForeignKeyConstraint(
+            ["invoice_id", "organization_id"],
+            ["invoices.id", "invoices.organization_id"],
+            name="fk_payment_allocations_invoice_organization",
+        ),
+        UniqueConstraint(
+            "payment_id", "invoice_id", name="uq_payment_allocations_payment_invoice"
+        ),
+        CheckConstraint("amount > 0", name="ck_payment_allocations_amount"),
+        Index(
+            "ix_payment_allocations_organization_invoice",
+            "organization_id",
+            "invoice_id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    payment_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    invoice_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    payment: Mapped[Payment] = relationship(
+        back_populates="allocations", overlaps="invoice,allocations"
+    )
+    invoice: Mapped[Invoice] = relationship(
+        back_populates="allocations", overlaps="payment,allocations"
+    )
+
+
+class PaymentAuditEvent(Base):
+    __tablename__ = "payment_audit_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["payment_id", "organization_id"],
+            ["payments.id", "payments.organization_id"],
+            name="fk_payment_audit_payment_organization",
+        ),
+        CheckConstraint(
+            "event_type = 'recorded'", name="ck_payment_audit_event_type"
+        ),
+        Index(
+            "ix_payment_audit_organization_payment_occurred",
+            "organization_id",
+            "payment_id",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid4
+    )
+    organization_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    payment_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    changed_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    payment: Mapped[Payment] = relationship(back_populates="audit_events")

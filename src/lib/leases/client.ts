@@ -200,6 +200,117 @@ export type PropertyExpenseUpdateFields = Partial<
   >
 >;
 
+export type InvoiceStatus = 'draft' | 'issued';
+export type InvoiceReceivableStatus = 'draft' | 'due' | 'overdue' | 'paid';
+
+export type InvoiceLineFields = {
+  description: string;
+  quantity: string;
+  unit_amount: string;
+  source_installment_id?: string | null;
+};
+
+export type InvoiceFields = {
+  lease_id: string;
+  invoice_number: string;
+  issue_date: string;
+  due_date: string;
+  currency: LeaseCurrency;
+  lines: InvoiceLineFields[];
+};
+
+export type InvoiceUpdateFields = Partial<
+  Pick<InvoiceFields, 'invoice_number' | 'issue_date' | 'due_date' | 'lines'>
+>;
+
+export type Invoice = {
+  id: string;
+  organization_id: string;
+  lease_id: string;
+  lease_reference: string;
+  invoice_number: string;
+  issue_date: string;
+  due_date: string;
+  currency: LeaseCurrency;
+  subtotal: string;
+  total: string;
+  allocated_amount: string;
+  outstanding_balance: string;
+  status: InvoiceStatus;
+  receivable_status: InvoiceReceivableStatus;
+  issued_at: string | null;
+  lines: (InvoiceLineFields & {
+    id: string;
+    quantity: string;
+    unit_amount: string;
+    line_total: string;
+    source_installment_id: string | null;
+  })[];
+  audit_events: {
+    actor_id: string;
+    event_type: 'created' | 'updated' | 'issued';
+    changed_fields: string[];
+    occurred_at: string;
+  }[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type EligibleInstallment = {
+  id: string;
+  lease_id: string;
+  schedule_id: string;
+  description: string;
+  charge_category: LeaseChargeCategory;
+  due_date: string;
+  amount: string;
+  currency: LeaseCurrency;
+};
+
+export type PaymentAllocationFields = {
+  invoice_id: string;
+  amount: string;
+};
+
+export type PaymentFields = {
+  idempotency_key: string;
+  reference: string;
+  received_on: string;
+  currency: LeaseCurrency;
+  amount: string;
+  method_description: string;
+  allocations: PaymentAllocationFields[];
+};
+
+export type Payment = {
+  id: string;
+  organization_id: string;
+  reference: string;
+  received_on: string;
+  currency: LeaseCurrency;
+  amount: string;
+  method_description: string;
+  allocations: (PaymentAllocationFields & { invoice_number: string })[];
+  audit_events: {
+    actor_id: string;
+    event_type: 'recorded';
+    changed_fields: string[];
+    occurred_at: string;
+  }[];
+  created_at: string;
+};
+
+export type LeaseReceivables = {
+  lease_id: string;
+  lease_reference: string;
+  currency: LeaseCurrency;
+  issued_total: string;
+  allocated_total: string;
+  outstanding_total: string;
+  overdue_total: string;
+  invoices: Invoice[];
+};
+
 export class LeaseRequestError extends Error {
   constructor(
     message: string,
@@ -404,4 +515,102 @@ export function updatePropertyExpense(
     'PATCH',
     fields,
   );
+}
+
+function invoicesPath(organizationId: string): string {
+  return `/api/invoices?${organizationQuery(organizationId)}`;
+}
+
+export function fetchInvoices(
+  organizationId: string,
+  filters: {
+    status?: InvoiceStatus;
+    receivableStatus?: InvoiceReceivableStatus;
+  } = {},
+): Promise<Invoice[]> {
+  const query = new URLSearchParams({ organizationId });
+  if (filters.status) query.set('status', filters.status);
+  if (filters.receivableStatus) {
+    query.set('receivable_status', filters.receivableStatus);
+  }
+  return requestJson(`/api/invoices?${query}`, 'GET');
+}
+
+export function createInvoice(
+  organizationId: string,
+  fields: InvoiceFields,
+): Promise<Invoice> {
+  return requestJson(invoicesPath(organizationId), 'POST', fields);
+}
+
+export function fetchInvoice(
+  organizationId: string,
+  invoiceId: string,
+): Promise<Invoice> {
+  assertUuid(invoiceId);
+  return requestJson(
+    `/api/invoices/${encodeURIComponent(invoiceId)}?${organizationQuery(organizationId)}`,
+    'GET',
+  );
+}
+
+export function updateInvoice(
+  organizationId: string,
+  invoiceId: string,
+  fields: InvoiceUpdateFields,
+): Promise<Invoice> {
+  assertUuid(invoiceId);
+  return requestJson(
+    `/api/invoices/${encodeURIComponent(invoiceId)}?${organizationQuery(organizationId)}`,
+    'PATCH',
+    fields,
+  );
+}
+
+export function issueInvoice(
+  organizationId: string,
+  invoiceId: string,
+): Promise<Invoice> {
+  assertUuid(invoiceId);
+  return requestJson(
+    `/api/invoices/${encodeURIComponent(invoiceId)}/issue?${organizationQuery(organizationId)}`,
+    'POST',
+    {},
+  );
+}
+
+export function fetchEligibleInstallments(
+  organizationId: string,
+  leaseId: string,
+): Promise<EligibleInstallment[]> {
+  assertUuid(leaseId);
+  return requestJson(
+    `/api/leases/${encodeURIComponent(leaseId)}/eligible-installments?${organizationQuery(organizationId)}`,
+    'GET',
+  );
+}
+
+export function fetchLeaseReceivables(
+  organizationId: string,
+  leaseId: string,
+): Promise<LeaseReceivables> {
+  assertUuid(leaseId);
+  return requestJson(
+    `/api/leases/${encodeURIComponent(leaseId)}/receivables?${organizationQuery(organizationId)}`,
+    'GET',
+  );
+}
+
+export function fetchPayments(organizationId: string): Promise<Payment[]> {
+  return requestJson(
+    `/api/payments?${organizationQuery(organizationId)}`,
+    'GET',
+  );
+}
+
+export function createPayment(
+  organizationId: string,
+  fields: PaymentFields,
+): Promise<Payment> {
+  return requestJson(`/api/payments?${organizationQuery(organizationId)}`, 'POST', fields);
 }

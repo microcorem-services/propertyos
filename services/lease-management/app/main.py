@@ -1,4 +1,5 @@
-from decimal import Decimal
+from datetime import date, datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
 from uuid import UUID, uuid4
@@ -14,6 +15,12 @@ from app.models import (
     LeaseAuditEvent,
     LeaseParty,
     LeaseUnit,
+    Invoice,
+    InvoiceAuditEvent,
+    InvoiceLine,
+    Payment,
+    PaymentAllocation,
+    PaymentAuditEvent,
     PropertyExpense,
     PropertyExpenseAuditEvent,
     RentInstallment,
@@ -23,6 +30,12 @@ from app.models import (
 from app.rent_schedules import generate_due_dates
 from app.schemas import (
     LeaseAuditEventResponse,
+    EligibleInstallmentResponse,
+    InvoiceCreateRequest,
+    InvoiceLineInput,
+    InvoiceResponse,
+    InvoiceUpdateRequest,
+    LeaseReceivablesResponse,
     LeaseCreateRequest,
     LeaseListResponse,
     LeasePartyResponse,
@@ -35,6 +48,8 @@ from app.schemas import (
     PropertyExpenseCreateRequest,
     PropertyExpenseResponse,
     PropertyExpenseUpdateRequest,
+    PaymentCreateRequest,
+    PaymentResponse,
     RentInstallmentResponse,
     RentScheduleCreateRequest,
     RentScheduleResponse,
@@ -482,6 +497,240 @@ def _verify_property_expense_asset(
 
 
 def _expense_request_fingerprint(payload: PropertyExpenseCreateRequest) -> str:
+    canonical = payload.model_dump(mode="json", exclude={"idempotency_key"})
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _money_text(value: Decimal) -> str:
+    return f"{Decimal(value):.2f}"
+
+
+def _invoice_line_values(line: InvoiceLineInput) -> tuple[Decimal, Decimal]:
+    line_total = (line.quantity * line.unit_amount).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    if line_total <= 0 or line_total > Decimal("999999999999.99"):
+        raise HTTPException(status_code=422, detail="Invoice line amount is out of range")
+    return line.quantity, line_total
+
+
+def _invoice_allocated_amount(session: Session, invoice_id: UUID, organization_id: UUID) -> Decimal:
+    try:
+        return Decimal(
+            session.scalar(
+                select(func.coalesce(func.sum(PaymentAllocation.amount), 0)).where(
+                    PaymentAllocation.invoice_id == invoice_id,
+                    PaymentAllocation.organization_id == organization_id,
+                )
+            )
+            or 0
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+
+
+def _invoice_response(
+    session: Session,
+    invoice: Invoice,
+    lease: Lease,
+    *,
+    today: date | None = None,
+) -> InvoiceResponse:
+    allocated = _invoice_allocated_amount(
+        session, invoice.id, invoice.organization_id
+    )
+    outstanding = max(Decimal("0.00"), Decimal(invoice.total) - allocated)
+    if invoice.status == "draft":
+        receivable_status = "draft"
+    elif outstanding == 0:
+        receivable_status = "paid"
+    elif invoice.due_date < (today or date.today()):
+        receivable_status = "overdue"
+    else:
+        receivable_status = "due"
+    return InvoiceResponse(
+        id=invoice.id,
+        organization_id=invoice.organization_id,
+        lease_id=invoice.lease_id,
+        lease_reference=lease.lease_reference,
+        invoice_number=invoice.invoice_number,
+        issue_date=invoice.issue_date,
+        due_date=invoice.due_date,
+        currency=invoice.currency,
+        subtotal=_money_text(invoice.subtotal),
+        total=_money_text(invoice.total),
+        allocated_amount=_money_text(allocated),
+        outstanding_balance=_money_text(outstanding),
+        status=invoice.status,
+        receivable_status=receivable_status,
+        issued_at=invoice.issued_at,
+        lines=[
+            {
+                "id": line.id,
+                "description": line.description,
+                "quantity": f"{Decimal(line.quantity):.3f}",
+                "unit_amount": _money_text(line.unit_amount),
+                "line_total": _money_text(line.line_total),
+                "source_installment_id": line.source_installment_id,
+            }
+            for line in invoice.lines
+        ],
+        audit_events=[
+            {
+                "actor_id": event.actor_id,
+                "event_type": event.event_type,
+                "changed_fields": event.changed_fields,
+                "occurred_at": event.occurred_at,
+            }
+            for event in sorted(invoice.audit_events, key=lambda item: item.occurred_at)
+        ],
+        created_at=invoice.created_at,
+        updated_at=invoice.updated_at,
+    )
+
+
+def _payment_response(session: Session, payment: Payment) -> PaymentResponse:
+    allocations = list(
+        session.execute(
+            select(PaymentAllocation, Invoice)
+            .join(
+                Invoice,
+                (Invoice.id == PaymentAllocation.invoice_id)
+                & (Invoice.organization_id == PaymentAllocation.organization_id),
+            )
+            .where(
+                PaymentAllocation.payment_id == payment.id,
+                PaymentAllocation.organization_id == payment.organization_id,
+            )
+            .order_by(Invoice.invoice_number)
+        )
+    )
+    return PaymentResponse(
+        id=payment.id,
+        organization_id=payment.organization_id,
+        reference=payment.reference,
+        received_on=payment.received_on,
+        currency=payment.currency,
+        amount=_money_text(payment.amount),
+        method_description=payment.method_description,
+        allocations=[
+            {
+                "invoice_id": allocation.invoice_id,
+                "invoice_number": invoice.invoice_number,
+                "amount": _money_text(allocation.amount),
+            }
+            for allocation, invoice in allocations
+        ],
+        audit_events=[
+            {
+                "actor_id": event.actor_id,
+                "event_type": event.event_type,
+                "changed_fields": event.changed_fields,
+                "occurred_at": event.occurred_at,
+            }
+            for event in sorted(payment.audit_events, key=lambda item: item.occurred_at)
+        ],
+        created_at=payment.created_at,
+    )
+
+
+def _invoice_line_models(
+    session: Session,
+    organization_id: UUID,
+    lease: Lease,
+    invoice_id: UUID,
+    lines: list[InvoiceLineInput],
+) -> tuple[list[InvoiceLine], Decimal]:
+    source_ids = [
+        line.source_installment_id
+        for line in lines
+        if line.source_installment_id is not None
+    ]
+    installments: dict[UUID, tuple[RentInstallment, RentSchedule]] = {}
+    if source_ids:
+        try:
+            rows = session.execute(
+                select(RentInstallment, RentSchedule)
+                .join(
+                    RentSchedule,
+                    (RentSchedule.id == RentInstallment.schedule_id)
+                    & (RentSchedule.organization_id == RentInstallment.organization_id),
+                )
+                .where(
+                    RentInstallment.id.in_(source_ids),
+                    RentInstallment.organization_id == organization_id,
+                    RentSchedule.lease_id == lease.id,
+                    RentSchedule.organization_id == organization_id,
+                    RentSchedule.status == "active",
+                    RentInstallment.status == "expected",
+                )
+                .order_by(RentInstallment.id)
+                .with_for_update()
+            )
+            installments = {
+                installment.id: (installment, schedule)
+                for installment, schedule in rows
+            }
+            if len(installments) != len(source_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail="A selected scheduled charge is not eligible for this lease",
+                )
+            reserved = set(
+                session.scalars(
+                    select(InvoiceLine.source_installment_id).where(
+                        InvoiceLine.organization_id == organization_id,
+                        InvoiceLine.source_installment_id.in_(source_ids),
+                        InvoiceLine.invoice_id != invoice_id,
+                    )
+                )
+            )
+        except HTTPException:
+            raise
+        except SQLAlchemyError:
+            _raise_database_unavailable()
+        if reserved:
+            raise HTTPException(
+                status_code=409,
+                detail="A selected scheduled charge is already reserved by another invoice",
+            )
+
+    result: list[InvoiceLine] = []
+    subtotal = Decimal("0.00")
+    for line in lines:
+        quantity, line_total = _invoice_line_values(line)
+        unit_amount = line.unit_amount
+        if line.source_installment_id is not None:
+            installment, schedule = installments[line.source_installment_id]
+            if (
+                quantity != Decimal("1")
+                or unit_amount != Decimal(installment.amount)
+                or line.description != schedule.description
+                or lease.currency != installment.currency
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Scheduled charge details must match the source instalment",
+                )
+        result.append(
+            InvoiceLine(
+                organization_id=organization_id,
+                invoice_id=invoice_id,
+                source_installment_id=line.source_installment_id,
+                description=line.description,
+                quantity=quantity,
+                unit_amount=unit_amount,
+                line_total=line_total,
+            )
+        )
+        subtotal += line_total
+    if subtotal > Decimal("999999999999.99"):
+        raise HTTPException(status_code=422, detail="Invoice total is out of range")
+    return result, subtotal
+
+
+def _invoice_request_fingerprint(payload: PaymentCreateRequest) -> str:
     canonical = payload.model_dump(mode="json", exclude={"idempotency_key"})
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -1017,6 +1266,642 @@ def generate_rent_schedule_installments(
         raise HTTPException(
             status_code=409,
             detail="Rent schedule generation conflicts with existing data",
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases/{{lease_id}}/eligible-installments",
+    response_model=list[EligibleInstallmentResponse],
+)
+def list_eligible_installments(
+    organization_id: UUID,
+    lease_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> list[EligibleInstallmentResponse]:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        lease = session.scalar(
+            select(Lease).where(
+                Lease.id == lease_id, Lease.organization_id == organization_id
+            )
+        )
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Lease not found")
+        rows = session.execute(
+            select(RentInstallment, RentSchedule)
+            .join(
+                RentSchedule,
+                (RentSchedule.id == RentInstallment.schedule_id)
+                & (RentSchedule.organization_id == RentInstallment.organization_id),
+            )
+            .outerjoin(
+                InvoiceLine,
+                (InvoiceLine.source_installment_id == RentInstallment.id)
+                & (InvoiceLine.organization_id == organization_id),
+            )
+            .where(
+                RentInstallment.organization_id == organization_id,
+                RentSchedule.lease_id == lease_id,
+                RentSchedule.status == "active",
+                RentInstallment.status == "expected",
+                InvoiceLine.id.is_(None),
+            )
+            .order_by(RentInstallment.due_date, RentInstallment.id)
+            .limit(500)
+        )
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    return [
+        EligibleInstallmentResponse(
+            id=installment.id,
+            lease_id=lease_id,
+            schedule_id=schedule.id,
+            description=schedule.description,
+            charge_category=schedule.charge_category,
+            due_date=installment.due_date,
+            amount=_money_text(installment.amount),
+            currency=installment.currency,
+        )
+        for installment, schedule in rows
+    ]
+
+
+def _invoice_query(organization_id: UUID):
+    return (
+        select(Invoice)
+        .options(selectinload(Invoice.lines), selectinload(Invoice.audit_events))
+        .where(Invoice.organization_id == organization_id)
+    )
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/invoices",
+    response_model=list[InvoiceResponse],
+)
+def list_invoices(
+    organization_id: UUID,
+    status_filter: str | None = Query(default=None, alias="status"),
+    receivable_status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> list[InvoiceResponse]:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if status_filter not in (None, "draft", "issued") or receivable_status not in (
+        None,
+        "draft",
+        "due",
+        "overdue",
+        "paid",
+    ):
+        raise HTTPException(status_code=422, detail="Invalid invoice filter")
+    try:
+        allocated_amount = (
+            select(func.coalesce(func.sum(PaymentAllocation.amount), 0))
+            .where(
+                PaymentAllocation.organization_id == organization_id,
+                PaymentAllocation.invoice_id == Invoice.id,
+            )
+            .scalar_subquery()
+        )
+        invoice_query = _invoice_query(organization_id)
+        if status_filter is not None:
+            invoice_query = invoice_query.where(Invoice.status == status_filter)
+        if receivable_status == "draft":
+            invoice_query = invoice_query.where(Invoice.status == "draft")
+        elif receivable_status == "due":
+            invoice_query = invoice_query.where(
+                Invoice.status == "issued",
+                Invoice.total > allocated_amount,
+                Invoice.due_date >= date.today(),
+            )
+        elif receivable_status == "overdue":
+            invoice_query = invoice_query.where(
+                Invoice.status == "issued",
+                Invoice.total > allocated_amount,
+                Invoice.due_date < date.today(),
+            )
+        elif receivable_status == "paid":
+            invoice_query = invoice_query.where(
+                Invoice.status == "issued",
+                Invoice.total <= allocated_amount,
+            )
+        invoices = list(
+            session.scalars(
+                invoice_query
+                .order_by(Invoice.issue_date.desc(), Invoice.invoice_number)
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        lease_ids = {invoice.lease_id for invoice in invoices}
+        leases = (
+            {
+                lease.id: lease
+                for lease in session.scalars(
+                    select(Lease).where(
+                        Lease.organization_id == organization_id,
+                        Lease.id.in_(lease_ids),
+                    )
+                )
+            }
+            if lease_ids
+            else {}
+        )
+        results = [
+            _invoice_response(session, invoice, leases[invoice.lease_id])
+            for invoice in invoices
+            if invoice.lease_id in leases
+        ]
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    return results
+
+
+@app.post(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/invoices",
+    response_model=InvoiceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_invoice(
+    organization_id: UUID,
+    payload: InvoiceCreateRequest,
+    authorization: AuthorizedOrganization = Depends(get_create_authorization),
+    session: Session = Depends(_database_session),
+) -> InvoiceResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    lease = _lease_for_schedule(session, organization_id, payload.lease_id)
+    if payload.currency != lease.currency:
+        raise HTTPException(status_code=422, detail="Invoice currency must match its lease")
+    invoice = Invoice(
+        id=uuid4(),
+        organization_id=organization_id,
+        lease_id=lease.id,
+        invoice_number=payload.invoice_number,
+        issue_date=payload.issue_date,
+        due_date=payload.due_date,
+        currency=payload.currency,
+        subtotal=Decimal("0.00"),
+        total=Decimal("0.00"),
+        status="draft",
+    )
+    try:
+        invoice.lines, subtotal = _invoice_line_models(
+            session, organization_id, lease, invoice.id, payload.lines
+        )
+        invoice.subtotal = subtotal
+        invoice.total = subtotal
+        invoice.audit_events.append(
+            InvoiceAuditEvent(
+                organization_id=organization_id,
+                actor_id=authorization.actor_id,
+                event_type="created",
+                changed_fields=[
+                    "invoice_number",
+                    "lease_id",
+                    "issue_date",
+                    "due_date",
+                    "currency",
+                    "lines",
+                    "subtotal",
+                    "total",
+                ],
+            )
+        )
+        session.add(invoice)
+        session.commit()
+        return _invoice_response(session, invoice, lease)
+    except HTTPException:
+        session.rollback()
+        raise
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Invoice number or scheduled charge conflicts with existing data",
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/invoices/{{invoice_id}}",
+    response_model=InvoiceResponse,
+)
+def get_invoice(
+    organization_id: UUID,
+    invoice_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> InvoiceResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        invoice = session.scalar(
+            _invoice_query(organization_id).where(Invoice.id == invoice_id)
+        )
+        lease = (
+            session.scalar(
+                select(Lease).where(
+                    Lease.id == invoice.lease_id,
+                    Lease.organization_id == organization_id,
+                )
+            )
+            if invoice is not None
+            else None
+        )
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    if invoice is None or lease is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    return _invoice_response(session, invoice, lease)
+
+
+@app.patch(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/invoices/{{invoice_id}}",
+    response_model=InvoiceResponse,
+)
+def update_invoice(
+    organization_id: UUID,
+    invoice_id: UUID,
+    payload: InvoiceUpdateRequest,
+    authorization: AuthorizedOrganization = Depends(get_update_authorization),
+    session: Session = Depends(_database_session),
+) -> InvoiceResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        invoice = session.scalar(
+            _invoice_query(organization_id)
+            .where(Invoice.id == invoice_id)
+            .with_for_update()
+        )
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        if invoice.status != "draft":
+            raise HTTPException(
+                status_code=409, detail="Issued invoice financial content is immutable"
+            )
+        lease = session.scalar(
+            select(Lease)
+            .where(
+                Lease.id == invoice.lease_id,
+                Lease.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Lease not found")
+        updates = payload.model_dump(exclude_unset=True)
+        next_issue = updates.get("issue_date", invoice.issue_date)
+        next_due = updates.get("due_date", invoice.due_date)
+        if next_due < next_issue:
+            raise HTTPException(
+                status_code=422, detail="Due date must not precede invoice issue date"
+            )
+        if "invoice_number" in updates:
+            invoice.invoice_number = updates["invoice_number"]
+        invoice.issue_date = next_issue
+        invoice.due_date = next_due
+        changed_fields = list(updates)
+        if "lines" in updates:
+            next_lines, subtotal = _invoice_line_models(
+                session,
+                organization_id,
+                lease,
+                invoice.id,
+                updates["lines"],
+            )
+            invoice.lines.clear()
+            session.flush()
+            invoice.lines.extend(next_lines)
+            invoice.subtotal = subtotal
+            invoice.total = subtotal
+            changed_fields.extend(["subtotal", "total"])
+        invoice.audit_events.append(
+            InvoiceAuditEvent(
+                organization_id=organization_id,
+                actor_id=authorization.actor_id,
+                event_type="updated",
+                changed_fields=changed_fields,
+            )
+        )
+        session.commit()
+        return _invoice_response(session, invoice, lease)
+    except HTTPException:
+        session.rollback()
+        raise
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Invoice number or scheduled charge conflicts with existing data",
+        ) from None
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.post(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/invoices/{{invoice_id}}/issue",
+    response_model=InvoiceResponse,
+)
+def issue_invoice(
+    organization_id: UUID,
+    invoice_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_update_authorization),
+    session: Session = Depends(_database_session),
+) -> InvoiceResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        invoice = session.scalar(
+            _invoice_query(organization_id)
+            .where(Invoice.id == invoice_id)
+            .with_for_update()
+        )
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        if invoice.status != "draft":
+            raise HTTPException(status_code=409, detail="Invoice is already issued")
+        if not invoice.lines or invoice.total <= 0:
+            raise HTTPException(
+                status_code=422, detail="An invoice must contain a positive line total"
+            )
+        lease = session.scalar(
+            select(Lease).where(
+                Lease.id == invoice.lease_id,
+                Lease.organization_id == organization_id,
+            )
+        )
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Lease not found")
+        invoice.status = "issued"
+        invoice.issued_at = datetime.now(timezone.utc)
+        invoice.audit_events.append(
+            InvoiceAuditEvent(
+                organization_id=organization_id,
+                actor_id=authorization.actor_id,
+                event_type="issued",
+                changed_fields=["status", "issued_at", "total"],
+            )
+        )
+        session.commit()
+        return _invoice_response(session, invoice, lease)
+    except HTTPException:
+        session.rollback()
+        raise
+    except SQLAlchemyError:
+        session.rollback()
+        _raise_database_unavailable()
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/leases/{{lease_id}}/receivables",
+    response_model=LeaseReceivablesResponse,
+)
+def lease_receivables(
+    organization_id: UUID,
+    lease_id: UUID,
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> LeaseReceivablesResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        lease = session.scalar(
+            select(Lease).where(
+                Lease.id == lease_id, Lease.organization_id == organization_id
+            )
+        )
+        if lease is None:
+            raise HTTPException(status_code=404, detail="Lease not found")
+        invoices = list(
+            session.scalars(
+                _invoice_query(organization_id)
+                .where(Invoice.lease_id == lease_id, Invoice.status == "issued")
+                .order_by(Invoice.due_date, Invoice.invoice_number)
+            )
+        )
+        items = [
+            _invoice_response(session, invoice, lease) for invoice in invoices
+        ]
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+    return LeaseReceivablesResponse(
+        lease_id=lease.id,
+        lease_reference=lease.lease_reference,
+        currency=lease.currency,
+        issued_total=_money_text(
+            sum((Decimal(item.total) for item in items), Decimal("0.00"))
+        ),
+        allocated_total=_money_text(
+            sum((Decimal(item.allocated_amount) for item in items), Decimal("0.00"))
+        ),
+        outstanding_total=_money_text(
+            sum(
+                (Decimal(item.outstanding_balance) for item in items),
+                Decimal("0.00"),
+            )
+        ),
+        overdue_total=_money_text(
+            sum(
+                (
+                    Decimal(item.outstanding_balance)
+                    for item in items
+                    if item.receivable_status == "overdue"
+                ),
+                Decimal("0.00"),
+            )
+        ),
+        invoices=items,
+    )
+
+
+def _payment_fingerprint(payload: PaymentCreateRequest) -> str:
+    canonical = payload.model_dump(mode="json", exclude={"idempotency_key"})
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@app.get(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/payments",
+    response_model=list[PaymentResponse],
+)
+def list_payments(
+    organization_id: UUID,
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10_000),
+    authorization: AuthorizedOrganization = Depends(get_read_authorization),
+    session: Session = Depends(_database_session),
+) -> list[PaymentResponse]:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        payments = list(
+            session.scalars(
+                select(Payment)
+                .options(selectinload(Payment.audit_events))
+                .where(Payment.organization_id == organization_id)
+                .order_by(Payment.received_on.desc(), Payment.id)
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        return [_payment_response(session, payment) for payment in payments]
+    except SQLAlchemyError:
+        _raise_database_unavailable()
+
+
+@app.post(
+    f"{API_V1_PREFIX}/organizations/{{organization_id}}/payments",
+    response_model=PaymentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_payment(
+    organization_id: UUID,
+    payload: PaymentCreateRequest,
+    authorization: AuthorizedOrganization = Depends(get_create_authorization),
+    session: Session = Depends(_database_session),
+) -> PaymentResponse:
+    if authorization.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    fingerprint = _payment_fingerprint(payload)
+    try:
+        existing = session.scalar(
+            select(Payment)
+            .options(selectinload(Payment.audit_events))
+            .where(
+                Payment.organization_id == organization_id,
+                Payment.idempotency_key == payload.idempotency_key,
+            )
+        )
+        if existing is not None:
+            if existing.request_fingerprint != fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency key was already used for different payment data",
+                )
+            return _payment_response(session, existing)
+
+        invoice_ids = sorted({item.invoice_id for item in payload.allocations}, key=str)
+        invoices = list(
+            session.scalars(
+                select(Invoice)
+                .where(
+                    Invoice.organization_id == organization_id,
+                    Invoice.id.in_(invoice_ids),
+                )
+                .order_by(Invoice.id)
+                .with_for_update()
+            )
+        )
+        by_id = {invoice.id: invoice for invoice in invoices}
+        if len(by_id) != len(invoice_ids):
+            raise HTTPException(status_code=404, detail="An allocated invoice was not found")
+        existing = session.scalar(
+            select(Payment)
+            .options(selectinload(Payment.audit_events))
+            .where(
+                Payment.organization_id == organization_id,
+                Payment.idempotency_key == payload.idempotency_key,
+            )
+        )
+        if existing is not None:
+            if existing.request_fingerprint != fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency key was already used for different payment data",
+                )
+            return _payment_response(session, existing)
+        for item in payload.allocations:
+            invoice = by_id[item.invoice_id]
+            if invoice.status != "issued":
+                raise HTTPException(
+                    status_code=409, detail="Payments may only be allocated to issued invoices"
+                )
+            if invoice.currency != payload.currency:
+                raise HTTPException(
+                    status_code=422, detail="Payment and invoice currencies must match"
+                )
+            outstanding = Decimal(invoice.total) - _invoice_allocated_amount(
+                session, invoice.id, organization_id
+            )
+            if item.amount > outstanding:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Payment allocation exceeds invoice outstanding balance",
+                )
+
+        payment = Payment(
+            organization_id=organization_id,
+            idempotency_key=payload.idempotency_key,
+            request_fingerprint=fingerprint,
+            reference=payload.reference,
+            received_on=payload.received_on,
+            currency=payload.currency,
+            amount=payload.amount,
+            method_description=payload.method_description,
+        )
+        payment.allocations = [
+            PaymentAllocation(
+                organization_id=organization_id,
+                invoice_id=item.invoice_id,
+                amount=item.amount,
+            )
+            for item in payload.allocations
+        ]
+        payment.audit_events.append(
+            PaymentAuditEvent(
+                organization_id=organization_id,
+                actor_id=authorization.actor_id,
+                event_type="recorded",
+                changed_fields=[
+                    "reference",
+                    "received_on",
+                    "currency",
+                    "amount",
+                    "method_description",
+                    "allocations",
+                ],
+            )
+        )
+        session.add(payment)
+        session.commit()
+        return _payment_response(session, payment)
+    except HTTPException:
+        session.rollback()
+        raise
+    except IntegrityError:
+        session.rollback()
+        try:
+            existing = session.scalar(
+                select(Payment)
+                .options(selectinload(Payment.audit_events))
+                .where(
+                    Payment.organization_id == organization_id,
+                    Payment.idempotency_key == payload.idempotency_key,
+                )
+            )
+        except SQLAlchemyError:
+            _raise_database_unavailable()
+        if existing is not None and existing.request_fingerprint == fingerprint:
+            return _payment_response(session, existing)
+        raise HTTPException(
+            status_code=409, detail="Payment conflicts with existing data"
         ) from None
     except SQLAlchemyError:
         session.rollback()

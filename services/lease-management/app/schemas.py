@@ -463,3 +463,202 @@ class LeaseResponse(BaseModel):
     audit_events: list[LeaseAuditEventResponse]
     created_at: datetime
     updated_at: datetime
+
+
+class InvoiceLineInput(APIModel):
+    description: str = Field(min_length=1, max_length=250)
+    quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)
+    unit_amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    source_installment_id: UUID | None = None
+
+    _quantity_must_not_be_float = field_validator("quantity", mode="before")(
+        reject_float_rent
+    )
+    _amount_must_not_be_float = field_validator("unit_amount", mode="before")(
+        reject_float_rent
+    )
+
+
+class InvoiceCreateRequest(APIModel):
+    lease_id: UUID
+    invoice_number: str = Field(min_length=1, max_length=100)
+    issue_date: date
+    due_date: date
+    currency: Literal["GBP", "EUR", "USD"]
+    lines: list[InvoiceLineInput] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_invoice(self):
+        if self.due_date < self.issue_date:
+            raise ValueError("Due date must not precede invoice issue date.")
+        if len(
+            [
+                line.source_installment_id
+                for line in self.lines
+                if line.source_installment_id is not None
+            ]
+        ) != len(
+            {
+                line.source_installment_id
+                for line in self.lines
+                if line.source_installment_id is not None
+            }
+        ):
+            raise ValueError("A scheduled instalment may only appear once.")
+        return self
+
+
+class InvoiceUpdateRequest(APIModel):
+    invoice_number: str | None = Field(default=None, min_length=1, max_length=100)
+    issue_date: date | None = None
+    due_date: date | None = None
+    lines: list[InvoiceLineInput] | None = Field(default=None, min_length=1, max_length=100)
+
+    @field_validator("invoice_number", "issue_date", "due_date", "lines")
+    @classmethod
+    def reject_null_for_supplied_fields(cls, value):
+        if value is None:
+            raise ValueError("This field cannot be null.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_invoice(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one field must be updated.")
+        if (
+            self.issue_date is not None
+            and self.due_date is not None
+            and self.due_date < self.issue_date
+        ):
+            raise ValueError("Due date must not precede invoice issue date.")
+        if self.lines is not None:
+            source_ids = [
+                line.source_installment_id
+                for line in self.lines
+                if line.source_installment_id is not None
+            ]
+            if len(source_ids) != len(set(source_ids)):
+                raise ValueError("A scheduled instalment may only appear once.")
+        return self
+
+
+class InvoiceIssueRequest(APIModel):
+    pass
+
+
+class PaymentAllocationInput(APIModel):
+    invoice_id: UUID
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+
+    _amount_must_not_be_float = field_validator("amount", mode="before")(
+        reject_float_rent
+    )
+
+
+class PaymentCreateRequest(APIModel):
+    idempotency_key: UUID
+    reference: str = Field(min_length=1, max_length=100)
+    received_on: date
+    currency: Literal["GBP", "EUR", "USD"]
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    method_description: str = Field(min_length=1, max_length=100)
+    allocations: list[PaymentAllocationInput] = Field(min_length=1, max_length=50)
+
+    _amount_must_not_be_float = field_validator("amount", mode="before")(
+        reject_float_rent
+    )
+
+    @model_validator(mode="after")
+    def validate_allocations(self):
+        if sum((item.amount for item in self.allocations), Decimal("0")) > self.amount:
+            raise ValueError("Allocations cannot exceed the recorded payment amount.")
+        invoice_ids = [item.invoice_id for item in self.allocations]
+        if len(invoice_ids) != len(set(invoice_ids)):
+            raise ValueError("Each invoice may only be allocated once per payment.")
+        return self
+
+
+class InvoiceLineResponse(BaseModel):
+    id: UUID
+    description: str
+    quantity: str
+    unit_amount: str
+    line_total: str
+    source_installment_id: UUID | None
+
+
+class InvoiceAuditEventResponse(BaseModel):
+    actor_id: UUID
+    event_type: Literal["created", "updated", "issued"]
+    changed_fields: list[str]
+    occurred_at: datetime
+
+
+class InvoiceResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    lease_id: UUID
+    lease_reference: str
+    invoice_number: str
+    issue_date: date
+    due_date: date
+    currency: Literal["GBP", "EUR", "USD"]
+    subtotal: str
+    total: str
+    allocated_amount: str
+    outstanding_balance: str
+    status: Literal["draft", "issued"]
+    receivable_status: Literal["draft", "due", "overdue", "paid"]
+    issued_at: datetime | None
+    lines: list[InvoiceLineResponse]
+    audit_events: list[InvoiceAuditEventResponse]
+    created_at: datetime
+    updated_at: datetime
+
+
+class EligibleInstallmentResponse(BaseModel):
+    id: UUID
+    lease_id: UUID
+    schedule_id: UUID
+    description: str
+    charge_category: str
+    due_date: date
+    amount: str
+    currency: Literal["GBP", "EUR", "USD"]
+
+
+class PaymentAllocationResponse(BaseModel):
+    invoice_id: UUID
+    invoice_number: str
+    amount: str
+
+
+class PaymentAuditEventResponse(BaseModel):
+    actor_id: UUID
+    event_type: Literal["recorded"]
+    changed_fields: list[str]
+    occurred_at: datetime
+
+
+class PaymentResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    reference: str
+    received_on: date
+    currency: Literal["GBP", "EUR", "USD"]
+    amount: str
+    method_description: str
+    allocations: list[PaymentAllocationResponse]
+    audit_events: list[PaymentAuditEventResponse]
+    created_at: datetime
+
+
+class LeaseReceivablesResponse(BaseModel):
+    lease_id: UUID
+    lease_reference: str
+    currency: Literal["GBP", "EUR", "USD"]
+    issued_total: str
+    allocated_total: str
+    outstanding_total: str
+    overdue_total: str
+    invoices: list[InvoiceResponse]

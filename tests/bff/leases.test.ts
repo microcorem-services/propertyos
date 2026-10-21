@@ -105,6 +105,64 @@ const propertyExpense = {
   created_at: '2026-05-20T11:00:00Z',
   updated_at: '2026-05-20T11:00:00Z',
 };
+const invoice = {
+  id: '00000000-0000-4000-8000-000000000960',
+  organization_id: organizationId,
+  lease_id: leaseId,
+  lease_reference: 'LEASE-2026-001',
+  invoice_number: 'INV-2026-001',
+  issue_date: '2026-01-01',
+  due_date: '2026-01-31',
+  currency: 'GBP',
+  subtotal: '27.76',
+  total: '27.76',
+  allocated_amount: '0.00',
+  outstanding_balance: '27.76',
+  status: 'draft',
+  receivable_status: 'draft',
+  issued_at: null,
+  lines: [
+    {
+      id: '00000000-0000-4000-8000-000000000961',
+      description: 'Service charge',
+      quantity: '2.000',
+      unit_amount: '13.88',
+      line_total: '27.76',
+      source_installment_id: null,
+    },
+  ],
+  audit_events: [
+    {
+      actor_id: '00000000-0000-4000-8000-000000000701',
+      event_type: 'created',
+      changed_fields: ['lines'],
+      occurred_at: '2026-01-01T10:00:00Z',
+    },
+  ],
+  created_at: '2026-01-01T10:00:00Z',
+  updated_at: '2026-01-01T10:00:00Z',
+};
+const payment = {
+  id: '00000000-0000-4000-8000-000000000970',
+  organization_id: organizationId,
+  reference: 'RECEIPT-001',
+  received_on: '2026-02-01',
+  currency: 'GBP',
+  amount: '10.00',
+  method_description: 'Manual transfer record',
+  allocations: [
+    { invoice_id: invoice.id, invoice_number: invoice.invoice_number, amount: '10.00' },
+  ],
+  audit_events: [
+    {
+      actor_id: '00000000-0000-4000-8000-000000000701',
+      event_type: 'recorded',
+      changed_fields: ['amount'],
+      occurred_at: '2026-02-01T10:00:00Z',
+    },
+  ],
+  created_at: '2026-02-01T10:00:00Z',
+};
 
 function jsonResponse(status: number, payload: unknown): Response {
   return Response.json(payload, { status });
@@ -554,4 +612,137 @@ test('property expense BFF rejects malformed updates and cross-organization payl
     400,
   );
   assert.equal(invalidUpdate.calls(), 0);
+});
+
+test('invoice BFF validates organisation-scoped amounts and keeps issued invoices immutable', async () => {
+  const path = `/api/invoices?organizationId=${organizationId}`;
+  const listed = setup({ payload: [invoice] });
+  const listResponse = await listed.handlers.listInvoices(listed.request(path));
+  assert.equal(listResponse.status, 200);
+  assert.deepEqual(await listResponse.json(), [invoice]);
+  assert.match(listed.requestedUrl()?.pathname ?? '', /\/invoices$/);
+
+  const fields = {
+    lease_id: leaseId,
+    invoice_number: 'INV-2026-001',
+    issue_date: '2026-01-01',
+    due_date: '2026-01-31',
+    currency: 'GBP',
+    lines: [{ description: 'Service charge', quantity: '2.000', unit_amount: '13.88' }],
+  };
+  const created = setup({ status: 201, payload: invoice });
+  const createResponse = await created.handlers.createInvoice(
+    created.request(path, 'POST', fields),
+  );
+  assert.equal(createResponse.status, 201);
+  assert.equal(JSON.parse(String(created.requestInit()?.body)).lines[0].quantity, '2.000');
+
+  const malformed = setup({
+    status: 201,
+    payload: { ...invoice, organization_id: '00000000-0000-4000-8000-000000000002' },
+  });
+  assert.equal(
+    (
+      await malformed.handlers.createInvoice(
+        malformed.request(path, 'POST', fields),
+      )
+    ).status,
+    502,
+  );
+
+  const issuedInvoice = {
+    ...invoice,
+    status: 'issued',
+    receivable_status: 'overdue',
+    issued_at: '2026-01-01T10:00:00Z',
+  };
+  const issued = setup({ payload: issuedInvoice });
+  assert.equal(
+    (
+      await issued.handlers.issueInvoice(
+        issued.request(
+          `/api/invoices/${invoice.id}/issue?organizationId=${organizationId}`,
+          'POST',
+          {},
+        ),
+        invoice.id,
+      )
+    ).status,
+    200,
+  );
+  const badTotal = setup({ payload: { ...invoice, total: '28.00' } });
+  assert.equal(
+    (
+      await badTotal.handlers.getInvoice(
+        badTotal.request(
+          `/api/invoices/${invoice.id}?organizationId=${organizationId}`,
+        ),
+        invoice.id,
+      )
+    ).status,
+    502,
+  );
+});
+
+test('payment BFF validates allocations and forwards idempotency under same-origin auth', async () => {
+  const path = `/api/payments?organizationId=${organizationId}`;
+  const fields = {
+    idempotency_key: '00000000-0000-4000-8000-000000000980',
+    reference: 'RECEIPT-001',
+    received_on: '2026-02-01',
+    currency: 'GBP',
+    amount: '10.00',
+    method_description: 'Manual transfer record',
+    allocations: [{ invoice_id: invoice.id, amount: '10.00' }],
+  };
+  const context = setup({ status: 201, payload: payment });
+  const response = await context.handlers.createPayment(
+    context.request(path, 'POST', fields),
+  );
+  assert.equal(response.status, 201);
+  assert.equal(
+    new Headers(context.requestInit()?.headers).get('authorization'),
+    `Bearer ${token}`,
+  );
+  assert.equal(
+    JSON.parse(String(context.requestInit()?.body)).idempotency_key,
+    fields.idempotency_key,
+  );
+
+  const overAllocated = setup({ status: 201, payload: payment });
+  const invalid = await overAllocated.handlers.createPayment(
+    overAllocated.request(path, 'POST', {
+      ...fields,
+      amount: '5.00',
+      allocations: [{ invoice_id: invoice.id, amount: '10.00' }],
+    }),
+  );
+  assert.equal(invalid.status, 400);
+  assert.equal(overAllocated.calls(), 0);
+
+  const crossOrganization = setup({
+    status: 201,
+    payload: {
+      ...payment,
+      organization_id: '00000000-0000-4000-8000-000000000002',
+    },
+  });
+  assert.equal(
+    (
+      await crossOrganization.handlers.createPayment(
+        crossOrganization.request(path, 'POST', fields),
+      )
+    ).status,
+    502,
+  );
+
+  const foreignOrigin = setup({ status: 201, payload: payment });
+  assert.equal(
+    (
+      await foreignOrigin.handlers.createPayment(
+        foreignOrigin.request(path, 'POST', fields, 'https://attacker.example'),
+      )
+    ).status,
+    403,
+  );
 });

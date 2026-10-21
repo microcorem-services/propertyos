@@ -34,6 +34,11 @@ const EXPENSE_CATEGORIES = new Set([
   'shared_facilities',
   'other',
 ]);
+const INVOICE_RECEIVABLE_STATUSES = new Set(['draft', 'due', 'overdue', 'paid']);
+const INVOICE_EVENT_TYPES = new Set(['created', 'updated', 'issued']);
+const PAYMENT_EVENT_TYPES = new Set(['recorded']);
+const MONEY_PATTERN = /^\d{1,12}\.\d{2}$/;
+const QUANTITY_PATTERN = /^\d{1,9}(?:\.\d{1,3})?$/;
 
 type RetrievedSession = { data: Record<string, string> };
 type SessionManager = {
@@ -81,6 +86,182 @@ function isTimestamp(value: unknown): value is string {
       value,
     ) &&
     !Number.isNaN(Date.parse(value))
+  );
+}
+
+function moneyCents(value: string): bigint {
+  const [whole, fraction] = value.split('.');
+  return BigInt(whole) * BigInt(100) + BigInt(fraction);
+}
+
+function calculatedLineCents(quantity: string, unitAmount: string): bigint {
+  const [whole, fraction = ''] = quantity.split('.');
+  const thousandths =
+    BigInt(whole) * BigInt(1000) + BigInt(fraction.padEnd(3, '0'));
+  return (
+    (thousandths * moneyCents(unitAmount) + BigInt(500)) / BigInt(1000)
+  );
+}
+
+function isInvoiceLineInput(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    typeof value.description === 'string' &&
+    value.description.trim().length > 0 &&
+    value.description.length <= 250 &&
+    typeof value.quantity === 'string' &&
+    QUANTITY_PATTERN.test(value.quantity) &&
+    (BigInt(value.quantity.split('.')[0]) > BigInt(0) ||
+      BigInt((value.quantity.split('.')[1] ?? '').padEnd(3, '0')) > BigInt(0)) &&
+    typeof value.unit_amount === 'string' &&
+    MONEY_PATTERN.test(value.unit_amount) &&
+    moneyCents(value.unit_amount) > BigInt(0) &&
+    (value.source_installment_id === undefined ||
+      value.source_installment_id === null ||
+      isUUID(value.source_installment_id))
+  );
+}
+
+function isInvoice(value: unknown, organizationId: string): boolean {
+  if (
+    !isRecord(value) ||
+    !isUUID(value.id) ||
+    !isUUID(value.organization_id) ||
+    value.organization_id.toLowerCase() !== organizationId.toLowerCase() ||
+    !isUUID(value.lease_id) ||
+    typeof value.lease_reference !== 'string' ||
+    !value.lease_reference ||
+    typeof value.invoice_number !== 'string' ||
+    !value.invoice_number ||
+    !isDate(value.issue_date) ||
+    !isDate(value.due_date) ||
+    value.due_date < value.issue_date ||
+    !CURRENCIES.has(String(value.currency)) ||
+    typeof value.subtotal !== 'string' ||
+    !MONEY_PATTERN.test(value.subtotal) ||
+    typeof value.total !== 'string' ||
+    !MONEY_PATTERN.test(value.total) ||
+    value.subtotal !== value.total ||
+    typeof value.allocated_amount !== 'string' ||
+    !MONEY_PATTERN.test(value.allocated_amount) ||
+    typeof value.outstanding_balance !== 'string' ||
+    !MONEY_PATTERN.test(value.outstanding_balance) ||
+    moneyCents(value.allocated_amount) > moneyCents(value.total) ||
+    moneyCents(value.outstanding_balance) !==
+      moneyCents(value.total) - moneyCents(value.allocated_amount) ||
+    (value.status !== 'draft' && value.status !== 'issued') ||
+    !INVOICE_RECEIVABLE_STATUSES.has(String(value.receivable_status)) ||
+    !(value.issued_at === null || isTimestamp(value.issued_at)) ||
+    !Array.isArray(value.lines) ||
+    value.lines.length === 0 ||
+    value.lines.length > 100 ||
+    !Array.isArray(value.audit_events) ||
+    !value.audit_events.every(
+      (event) =>
+        isRecord(event) &&
+        isUUID(event.actor_id) &&
+        INVOICE_EVENT_TYPES.has(String(event.event_type)) &&
+        Array.isArray(event.changed_fields) &&
+        event.changed_fields.every((field) => typeof field === 'string') &&
+        isTimestamp(event.occurred_at),
+    ) ||
+    !isTimestamp(value.created_at) ||
+    !isTimestamp(value.updated_at)
+  ) {
+    return false;
+  }
+  let sum = BigInt(0);
+  const sources = new Set<string>();
+  for (const line of value.lines) {
+    if (
+      !isRecord(line) ||
+      !isUUID(line.id) ||
+      !isInvoiceLineInput(line) ||
+      typeof line.quantity !== 'string' ||
+      typeof line.unit_amount !== 'string' ||
+      typeof line.line_total !== 'string' ||
+      !MONEY_PATTERN.test(line.line_total) ||
+      (line.source_installment_id !== null &&
+        !isUUID(line.source_installment_id)) ||
+      calculatedLineCents(line.quantity, line.unit_amount) !==
+        moneyCents(line.line_total)
+    ) {
+      return false;
+    }
+    if (typeof line.source_installment_id === 'string') {
+      if (sources.has(line.source_installment_id)) return false;
+      sources.add(line.source_installment_id);
+    }
+    sum += moneyCents(line.line_total);
+  }
+  return sum === moneyCents(value.total);
+}
+
+function isPayment(value: unknown, organizationId: string): boolean {
+  if (
+    !isRecord(value) ||
+    !isUUID(value.id) ||
+    !isUUID(value.organization_id) ||
+    value.organization_id.toLowerCase() !== organizationId.toLowerCase() ||
+    typeof value.reference !== 'string' ||
+    !value.reference.trim() ||
+    !isDate(value.received_on) ||
+    !CURRENCIES.has(String(value.currency)) ||
+    typeof value.amount !== 'string' ||
+    !MONEY_PATTERN.test(value.amount) ||
+    typeof value.method_description !== 'string' ||
+    !value.method_description.trim() ||
+    !Array.isArray(value.allocations) ||
+    value.allocations.length === 0 ||
+    !Array.isArray(value.audit_events) ||
+    !value.audit_events.every(
+      (event) =>
+        isRecord(event) &&
+        isUUID(event.actor_id) &&
+        PAYMENT_EVENT_TYPES.has(String(event.event_type)) &&
+        Array.isArray(event.changed_fields) &&
+        event.changed_fields.every((field) => typeof field === 'string') &&
+        isTimestamp(event.occurred_at),
+    ) ||
+    !isTimestamp(value.created_at)
+  ) {
+    return false;
+  }
+  const invoices = new Set<string>();
+  let allocated = BigInt(0);
+  for (const item of value.allocations) {
+    if (
+      !isRecord(item) ||
+      !isUUID(item.invoice_id) ||
+      typeof item.invoice_number !== 'string' ||
+      !item.invoice_number ||
+      typeof item.amount !== 'string' ||
+      !MONEY_PATTERN.test(item.amount) ||
+      moneyCents(item.amount) <= BigInt(0) ||
+      invoices.has(item.invoice_id)
+    ) {
+      return false;
+    }
+    invoices.add(item.invoice_id);
+    allocated += moneyCents(item.amount);
+  }
+  return allocated <= moneyCents(value.amount);
+}
+
+function isEligibleInstallment(value: unknown, leaseId: string): boolean {
+  return (
+    isRecord(value) &&
+    isUUID(value.id) &&
+    isUUID(value.lease_id) &&
+    value.lease_id.toLowerCase() === leaseId.toLowerCase() &&
+    isUUID(value.schedule_id) &&
+    typeof value.description === 'string' &&
+    value.description.length > 0 &&
+    CHARGE_CATEGORIES.has(String(value.charge_category)) &&
+    isDate(value.due_date) &&
+    typeof value.amount === 'string' &&
+    MONEY_PATTERN.test(value.amount) &&
+    CURRENCIES.has(String(value.currency))
   );
 }
 
@@ -475,7 +656,14 @@ async function readJsonResponse(response: Response): Promise<unknown> {
 
 function statusError(
   status: number,
-  detail: 'list' | 'detail' | 'write' | 'schedule' | 'expense',
+  detail:
+    | 'list'
+    | 'detail'
+    | 'write'
+    | 'schedule'
+    | 'expense'
+    | 'invoice'
+    | 'payment',
 ): Response {
   if (status === 401) return errorResponse(401, 'Authentication required.');
   if (status === 403) return errorResponse(403, 'Organisation access denied.');
@@ -486,6 +674,10 @@ function statusError(
         ? 'Rent schedule not found.'
         : detail === 'expense'
           ? 'Property expense not found.'
+          : detail === 'invoice'
+            ? 'Invoice not found.'
+            : detail === 'payment'
+              ? 'Payment not found.'
           : 'Lease not found.',
     );
   }
@@ -494,13 +686,19 @@ function statusError(
       409,
       detail === 'expense'
         ? 'Property expense conflicts with existing data.'
+        : detail === 'invoice' || detail === 'payment'
+          ? 'Financial record conflicts with existing data.'
         : 'Lease conflicts with existing data.',
     );
   }
   if (status === 422) {
     return errorResponse(
       400,
-      detail === 'expense' ? 'Property expense information is invalid.' : 'Lease information is invalid.',
+      detail === 'expense'
+        ? 'Property expense information is invalid.'
+        : detail === 'invoice' || detail === 'payment'
+          ? 'Financial record information is invalid.'
+          : 'Lease information is invalid.',
     );
   }
   return errorResponse(
@@ -509,6 +707,8 @@ function statusError(
       ? 'Lease could not be saved.'
       : detail === 'expense'
         ? 'Property Expense service unavailable.'
+        : detail === 'invoice' || detail === 'payment'
+          ? 'Financial service unavailable.'
         : 'Lease service unavailable.',
   );
 }
@@ -526,7 +726,14 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     organizationId: string,
     expectedStatus: number,
     body?: unknown,
-    detail: 'list' | 'detail' | 'write' | 'schedule' | 'expense' = 'detail',
+    detail:
+      | 'list'
+      | 'detail'
+      | 'write'
+      | 'schedule'
+      | 'expense'
+      | 'invoice'
+      | 'payment' = 'detail',
   ): Promise<Response> {
     try {
       const token = await readAccessToken(request, dependencies.sessions, now);
@@ -1105,6 +1312,430 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     }
   }
 
+  function financialContext(
+    request: Request,
+    recordId?: string,
+  ): { organizationId: string; path: string } | Response {
+    const url = new URL(request.url);
+    const organizationId = readOrganizationId(url);
+    if (
+      !organizationId ||
+      (recordId !== undefined && !isUUID(recordId)) ||
+      url.searchParams.getAll('organizationId').length !== 1
+    ) {
+      return errorResponse(400, 'Invalid financial request.');
+    }
+    return { organizationId, path: `${API_PREFIX}/${organizationId}` };
+  }
+
+  function isInvoiceBody(value: unknown, create: boolean): boolean {
+    if (!isRecord(value)) return false;
+    const allowed = create
+      ? ['lease_id', 'invoice_number', 'issue_date', 'due_date', 'currency', 'lines']
+      : ['invoice_number', 'issue_date', 'due_date', 'lines'];
+    const required = create ? allowed : [];
+    const keys = Object.keys(value);
+    if (
+      keys.length === 0 ||
+      keys.some((key) => !allowed.includes(key)) ||
+      required.some((key) => !(key in value))
+    ) {
+      return false;
+    }
+    if (create && !isUUID(value.lease_id)) return false;
+    if (
+      value.invoice_number !== undefined &&
+      (typeof value.invoice_number !== 'string' ||
+        value.invoice_number.trim().length === 0 ||
+        value.invoice_number.length > 100)
+    ) {
+      return false;
+    }
+    if (value.issue_date !== undefined && !isDate(value.issue_date)) return false;
+    if (value.due_date !== undefined && !isDate(value.due_date)) return false;
+    if (
+      create &&
+      typeof value.issue_date === 'string' &&
+      typeof value.due_date === 'string' &&
+      value.due_date < value.issue_date
+    ) {
+      return false;
+    }
+    if (value.currency !== undefined && !CURRENCIES.has(String(value.currency))) {
+      return false;
+    }
+    if (value.lines !== undefined) {
+      if (!Array.isArray(value.lines) || value.lines.length < 1 || value.lines.length > 100) {
+        return false;
+      }
+      const sourceIds = new Set<string>();
+      for (const line of value.lines) {
+        if (
+          !isInvoiceLineInput(line) ||
+          Object.keys(line).some(
+            (key) =>
+              ![
+                'description',
+                'quantity',
+                'unit_amount',
+                'source_installment_id',
+              ].includes(key),
+          )
+        ) {
+          return false;
+        }
+        if (
+          typeof line.source_installment_id === 'string' &&
+          sourceIds.has(line.source_installment_id)
+        ) {
+          return false;
+        }
+        if (typeof line.source_installment_id === 'string') {
+          sourceIds.add(line.source_installment_id);
+        }
+      }
+    }
+    return true;
+  }
+
+  function isPaymentBody(value: unknown): boolean {
+    if (
+      !isRecord(value) ||
+      Object.keys(value).some(
+        (key) =>
+          ![
+            'idempotency_key',
+            'reference',
+            'received_on',
+            'currency',
+            'amount',
+            'method_description',
+            'allocations',
+          ].includes(key),
+      ) ||
+      !isUUID(value.idempotency_key) ||
+      typeof value.reference !== 'string' ||
+      !value.reference.trim() ||
+      value.reference.length > 100 ||
+      !isDate(value.received_on) ||
+      !CURRENCIES.has(String(value.currency)) ||
+      typeof value.amount !== 'string' ||
+      !MONEY_PATTERN.test(value.amount) ||
+      moneyCents(value.amount) <= BigInt(0) ||
+      typeof value.method_description !== 'string' ||
+      !value.method_description.trim() ||
+      value.method_description.length > 100 ||
+      !Array.isArray(value.allocations) ||
+      value.allocations.length < 1 ||
+      value.allocations.length > 50
+    ) {
+      return false;
+    }
+    const invoices = new Set<string>();
+    let allocated = BigInt(0);
+    for (const item of value.allocations) {
+      if (
+        !isRecord(item) ||
+        Object.keys(item).some((key) => !['invoice_id', 'amount'].includes(key)) ||
+        !isUUID(item.invoice_id) ||
+        typeof item.amount !== 'string' ||
+        !MONEY_PATTERN.test(item.amount) ||
+        moneyCents(item.amount) <= BigInt(0) ||
+        invoices.has(item.invoice_id)
+      ) {
+        return false;
+      }
+      invoices.add(item.invoice_id);
+      allocated += moneyCents(item.amount);
+    }
+    return allocated <= moneyCents(value.amount);
+  }
+
+  async function listInvoices(request: Request): Promise<Response> {
+    const context = financialContext(request);
+    if (context instanceof Response) return context;
+    const url = new URL(request.url);
+    const allowedKeys = new Set([
+      'organizationId',
+      'status',
+      'receivable_status',
+      'limit',
+      'offset',
+    ]);
+    if ([...url.searchParams.keys()].some((key) => !allowedKeys.has(key))) {
+      return errorResponse(400, 'Invalid invoice request.');
+    }
+    for (const key of ['organizationId', 'status', 'receivable_status', 'limit', 'offset']) {
+      if (url.searchParams.getAll(key).length > 1) {
+        return errorResponse(400, 'Invalid invoice request.');
+      }
+    }
+    const statusValue = url.searchParams.get('status');
+    const receivableStatus = url.searchParams.get('receivable_status');
+    const limit = url.searchParams.get('limit') ?? '100';
+    const offset = url.searchParams.get('offset') ?? '0';
+    if (
+      (statusValue !== null && !['draft', 'issued'].includes(statusValue)) ||
+      (receivableStatus !== null &&
+        !INVOICE_RECEIVABLE_STATUSES.has(receivableStatus)) ||
+      !/^(?:[1-9]\d?|100)$/.test(limit) ||
+      !/^(?:0|[1-9]\d{0,4})$/.test(offset) ||
+      Number(offset) > 10_000
+    ) {
+      return errorResponse(400, 'Invalid invoice request.');
+    }
+    const query = new URLSearchParams({ limit, offset });
+    if (statusValue) query.set('status', statusValue);
+    if (receivableStatus) query.set('receivable_status', receivableStatus);
+    const response = await perform(
+      request,
+      'GET',
+      `${context.path}/invoices?${query}`,
+      context.organizationId,
+      200,
+      undefined,
+      'invoice',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (
+      !Array.isArray(payload) ||
+      payload.length > Number(limit) ||
+      payload.some((item) => !isInvoice(item, context.organizationId))
+    ) {
+      return errorResponse(502, 'Invalid invoice response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function getInvoice(request: Request, invoiceId: string): Promise<Response> {
+    const context = financialContext(request, invoiceId);
+    if (context instanceof Response) return context;
+    const response = await perform(
+      request,
+      'GET',
+      `${context.path}/invoices/${invoiceId}`,
+      context.organizationId,
+      200,
+      undefined,
+      'invoice',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (!isInvoice(payload, context.organizationId)) {
+      return errorResponse(502, 'Invalid invoice response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function writeInvoice(
+    request: Request,
+    invoiceId?: string,
+    issue = false,
+  ): Promise<Response> {
+    const context = financialContext(request, invoiceId);
+    if (context instanceof Response) return context;
+    try {
+      if (!isSameOriginWriteRequest(request, (dependencies.appOrigin ?? loadAppOrigin)())) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      const body = await readJsonBody(request);
+      if (
+        (issue && (!isRecord(body) || Object.keys(body).length !== 0)) ||
+        (!issue && !isInvoiceBody(body, invoiceId === undefined))
+      ) {
+        return errorResponse(400, 'Invalid invoice request.');
+      }
+      const expectedStatus = invoiceId === undefined ? 201 : 200;
+      const method = invoiceId === undefined ? 'POST' : issue ? 'POST' : 'PATCH';
+      const path = issue
+        ? `${context.path}/invoices/${invoiceId}/issue`
+        : invoiceId === undefined
+          ? `${context.path}/invoices`
+          : `${context.path}/invoices/${invoiceId}`;
+      const response = await perform(
+        request,
+        method,
+        path,
+        context.organizationId,
+        expectedStatus,
+        body,
+        'invoice',
+      );
+      if (response.status !== expectedStatus) return response;
+      const payload: unknown = await response.json();
+      if (!isInvoice(payload, context.organizationId)) {
+        return errorResponse(502, 'Invalid invoice response.');
+      }
+      return Response.json(payload, {
+        status: expectedStatus,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(400, 'Invalid invoice request.');
+    }
+  }
+
+  async function eligibleInstallments(
+    request: Request,
+    leaseId: string,
+  ): Promise<Response> {
+    const context = financialContext(request);
+    if (context instanceof Response) return context;
+    const url = new URL(request.url);
+    if (
+      !isUUID(leaseId) ||
+      [...url.searchParams.keys()].some((key) => key !== 'organizationId')
+    ) {
+      return errorResponse(400, 'Invalid scheduled charge request.');
+    }
+    const response = await perform(
+      request,
+      'GET',
+      `${context.path}/leases/${leaseId}/eligible-installments`,
+      context.organizationId,
+      200,
+      undefined,
+      'invoice',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (
+      !Array.isArray(payload) ||
+      payload.length > 500 ||
+      payload.some((item) => !isEligibleInstallment(item, leaseId))
+    ) {
+      return errorResponse(502, 'Invalid scheduled charge response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function leaseReceivables(
+    request: Request,
+    leaseId: string,
+  ): Promise<Response> {
+    const context = financialContext(request);
+    if (context instanceof Response) return context;
+    const url = new URL(request.url);
+    if (
+      !isUUID(leaseId) ||
+      [...url.searchParams.keys()].some((key) => key !== 'organizationId')
+    ) {
+      return errorResponse(400, 'Invalid receivables request.');
+    }
+    const response = await perform(
+      request,
+      'GET',
+      `${context.path}/leases/${leaseId}/receivables`,
+      context.organizationId,
+      200,
+      undefined,
+      'invoice',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (
+      !isRecord(payload) ||
+      !isUUID(payload.lease_id) ||
+      payload.lease_id.toLowerCase() !== leaseId.toLowerCase() ||
+      typeof payload.lease_reference !== 'string' ||
+      !CURRENCIES.has(String(payload.currency)) ||
+      !['issued_total', 'allocated_total', 'outstanding_total', 'overdue_total'].every(
+        (key) =>
+          typeof payload[key] === 'string' &&
+          MONEY_PATTERN.test(payload[key] as string),
+      ) ||
+      !Array.isArray(payload.invoices) ||
+      payload.invoices.some((invoice) => !isInvoice(invoice, context.organizationId))
+    ) {
+      return errorResponse(502, 'Invalid receivables response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function listPayments(request: Request): Promise<Response> {
+    const context = financialContext(request);
+    if (context instanceof Response) return context;
+    const url = new URL(request.url);
+    if (
+      [...url.searchParams.keys()].some(
+        (key) => !['organizationId', 'limit', 'offset'].includes(key),
+      )
+    ) {
+      return errorResponse(400, 'Invalid payment request.');
+    }
+    const limit = url.searchParams.get('limit') ?? '100';
+    const offset = url.searchParams.get('offset') ?? '0';
+    if (
+      !/^(?:[1-9]\d?|100)$/.test(limit) ||
+      !/^(?:0|[1-9]\d{0,4})$/.test(offset) ||
+      Number(offset) > 10_000
+    ) {
+      return errorResponse(400, 'Invalid payment request.');
+    }
+    const response = await perform(
+      request,
+      'GET',
+      `${context.path}/payments?limit=${limit}&offset=${offset}`,
+      context.organizationId,
+      200,
+      undefined,
+      'payment',
+    );
+    if (response.status !== 200) return response;
+    const payload: unknown = await response.json();
+    if (
+      !Array.isArray(payload) ||
+      payload.length > Number(limit) ||
+      payload.some((item) => !isPayment(item, context.organizationId))
+    ) {
+      return errorResponse(502, 'Invalid payment response.');
+    }
+    return Response.json(payload, {
+      headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    });
+  }
+
+  async function createPayment(request: Request): Promise<Response> {
+    const context = financialContext(request);
+    if (context instanceof Response) return context;
+    try {
+      if (!isSameOriginWriteRequest(request, (dependencies.appOrigin ?? loadAppOrigin)())) {
+        return errorResponse(403, 'Request origin is not allowed.');
+      }
+      const body = await readJsonBody(request);
+      if (!isPaymentBody(body)) return errorResponse(400, 'Invalid payment request.');
+      const response = await perform(
+        request,
+        'POST',
+        `${context.path}/payments`,
+        context.organizationId,
+        201,
+        body,
+        'payment',
+      );
+      if (response.status !== 201) return response;
+      const payload: unknown = await response.json();
+      if (!isPayment(payload, context.organizationId)) {
+        return errorResponse(502, 'Invalid payment response.');
+      }
+      return Response.json(payload, {
+        status: 201,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    } catch {
+      return errorResponse(400, 'Invalid payment request.');
+    }
+  }
+
   return {
     getPermissions,
     list,
@@ -1126,6 +1757,17 @@ export function createLeaseHandlers(dependencies: LeaseHandlerDependencies) {
     getPropertyExpense,
     updatePropertyExpense: (request: Request, expenseId: string) =>
       writePropertyExpense(request, expenseId),
+    listInvoices,
+    createInvoice: (request: Request) => writeInvoice(request),
+    getInvoice,
+    updateInvoice: (request: Request, invoiceId: string) =>
+      writeInvoice(request, invoiceId),
+    issueInvoice: (request: Request, invoiceId: string) =>
+      writeInvoice(request, invoiceId, true),
+    eligibleInstallments,
+    leaseReceivables,
+    listPayments,
+    createPayment,
     detail,
     create: (request: Request, organizationId: string) =>
       write(request, organizationId),

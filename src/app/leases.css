@@ -60,3 +60,36 @@
 @media(max-width:650px){.lease-section-heading{align-items:flex-start;flex-direction:column}.lease-rent-schedule{padding:14px}.rent-schedule-form{padding:12px}.lease-installments-table{min-width:500px}}
 @media(max-width:900px){.lease-unit-picker{grid-template-columns:repeat(2,minmax(0,1fr))}.lease-unit-picker button{justify-self:start}}
 @media(max-width:650px){.lease-main{padding-left:16px;padding-right:16px}.lease-toolbar{align-items:stretch;flex-direction:column}.lease-toolbar input{min-width:0;width:100%}.lease-create-button{margin-left:0;align-self:start}.lease-pagination{align-items:flex-start;flex-direction:column}.lease-detail,.lease-form{padding:16px}.lease-detail-grid,.lease-form-grid,.lease-unit-picker,.lease-party-row{grid-template-columns:1fr}.lease-detail-heading{align-items:flex-start;flex-direction:column}.lease-party-row{align-items:stretch}.lease-party-row .lease-remove-party{justify-self:start;margin:0}.lease-form-actions>*{flex:1}}
+.invoice-toolbar{align-items:end}
+.invoice-register-link{white-space:nowrap}
+.invoice-table-wrap,.invoice-lines-wrap{margin:16px 0}
+.invoice-table{min-width:900px}
+.invoice-select{border:0;background:transparent;padding:0;font:inherit;cursor:pointer}
+.invoice-select:focus-visible,.invoice-remove-line:focus-visible{outline:3px solid #19758a;outline-offset:3px}
+.invoice-row-selected{background:#eef7f8}
+.lease-status-due{background:#fff2d8;color:#704900}
+.lease-status-overdue{background:#f8e5e5;color:#812727}
+.lease-status-paid{background:#e0f2e8;color:#155d3c}
+.invoice-overdue,.invoice-payments{display:grid;gap:12px;margin:24px 0}
+.invoice-overdue h2,.invoice-payments h2{margin:0;color:#173c51;font-size:21px}
+.invoice-overdue p{margin:0;color:#526a78}
+.invoice-overdue ul{display:grid;gap:10px;margin:0;padding:0;list-style:none}
+.invoice-overdue li{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 14px;background:#fff;border:1px solid #e5caca;border-radius:8px}
+.invoice-overdue li span{color:#526a78}
+.invoice-detail{margin-top:24px}
+.invoice-detail>h3,.invoice-audit h3{margin:0}
+.invoice-lines-table{min-width:700px}
+.invoice-lines-table caption{padding:12px;text-align:left;color:#294253;font-weight:700}
+.invoice-draft-form,.invoice-payment-form{margin-top:24px}
+.invoice-draft-form>fieldset{display:grid;gap:20px}
+.invoice-schedule-picker,.invoice-line-editor{display:grid;gap:12px;margin-top:18px}
+.invoice-schedule-option{display:flex!important;grid-template-columns:auto 1fr!important;align-items:center;gap:10px!important;padding:9px 0;border-bottom:1px solid #e4ebef}
+.invoice-schedule-option input{min-height:auto}
+.invoice-line-row{display:grid;grid-template-columns:2fr 1fr 1fr auto;align-items:end;gap:12px;padding:12px 0;border-bottom:1px solid #e4ebef}
+.invoice-line-row .lease-field-note{grid-column:1/-1}
+.invoice-remove-line{min-height:44px;padding:9px 12px;border:1px solid #899ca9;border-radius:6px;background:#fff;color:#294253;font:inherit;cursor:pointer}
+.invoice-remove-line:disabled{opacity:.55;cursor:not-allowed}
+.invoice-secondary-button{background:#eef3f5}
+.invoice-audit{border-top:1px solid #e4ebef;padding-top:18px}
+.invoice-payments-table{min-width:800px}
+@media(max-width:650px){.invoice-line-row{grid-template-columns:1fr}.invoice-line-row .lease-field-note{grid-column:auto}.invoice-overdue li{align-items:flex-start;flex-direction:column}.invoice-draft-form,.invoice-payment-form{padding:14px}}

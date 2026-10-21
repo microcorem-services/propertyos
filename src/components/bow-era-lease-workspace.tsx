@@ -435,6 +435,11 @@ function LeaseRegister({
               Create lease
             </Link>
           )}
+          {permissions?.can_read && (
+            <Link className="bow-era-button invoice-register-link" href={`/invoices?organizationId=${encodeURIComponent(organizationId)}`}>
+              Invoices &amp; receivables
+            </Link>
+          )}
         </div>
         {loading ? (
           <LoadingState label="Loading leases and checking organisation permissions…" />
