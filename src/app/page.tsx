@@ -1,86 +1,78 @@
-'use client';
-
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
-import { DashboardStats, Property, propertyApi } from '@/lib/api';
+import styles from './preview.module.css';
+
+const previewAreas = [
+  {
+    number: '01',
+    title: 'Property operations',
+    detail: 'Portfolio and property workflows are not connected in this preview.',
+  },
+  {
+    number: '02',
+    title: 'Organisation access',
+    detail: 'Sign-in and organisation membership are not enabled here.',
+  },
+  {
+    number: '03',
+    title: 'Finance and reporting',
+    detail: 'No invoices, balances, reports, or customer records are available.',
+  },
+];
 
 export default function Home() {
-  const [stats, setStats] = useState<DashboardStats | null>(null);
-  const [properties, setProperties] = useState<Property[]>([]);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    Promise.all([propertyApi.stats(), propertyApi.list()])
-      .then(([nextStats, nextProperties]) => {
-        setStats(nextStats);
-        setProperties(nextProperties.slice(0, 5));
-      })
-      .catch((loadError: Error) => setError(loadError.message))
-      .finally(() => setLoading(false));
-  }, []);
-
   return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">MICROCOREM <span>PropertyOS</span></div>
-        <nav aria-label="Main navigation">
-          <Link className="active" href="/">Overview</Link>
-          <Link href="/properties">Properties</Link>
-        </nav>
-        <p className="sidebarNote">Portfolio demo · Fictional records</p>
-      </aside>
-      <section className="content">
-        <header>
-          <div>
-            <p className="eyebrow">ASSET MANAGEMENT</p>
-            <h1>Property overview</h1>
-            <p className="muted">A clear view of your property portfolio.</p>
-          </div>
-          <span className="tag">Demonstration</span>
+    <main className={styles.page}>
+      <div className={styles.frame}>
+        <header className={styles.header}>
+          <Link className={styles.wordmark} href="/" aria-label="BOWERA preview home">
+            <span className={styles.mark} aria-hidden="true">B</span>
+            <span>BOWERA</span>
+          </Link>
+          <span className={styles.previewBadge}>DEVELOPMENT PREVIEW</span>
         </header>
 
-        {error && <p className="alert error" role="alert">Could not load portfolio: {error}</p>}
-
-        <div className="metrics" aria-label="Portfolio statistics">
-          <article><span>Properties</span><strong>{loading ? '—' : stats?.properties ?? 0}</strong></article>
-          <article><span>Total units</span><strong>{loading ? '—' : stats?.total_units ?? 0}</strong></article>
-          <article><span>Occupancy</span><strong>{loading ? '—' : `${stats?.occupancy_percent ?? 0}%`}</strong></article>
-        </div>
-
-        <section className="panel" id="properties">
-          <div className="panelHeading">
-            <h2>Properties</h2>
-            <Link className="textLink" href="/properties">Manage properties</Link>
-          </div>
-          {loading ? (
-            <p className="state" role="status">Loading portfolio…</p>
-          ) : error ? (
-            <p className="state">Portfolio data is unavailable.</p>
-          ) : properties.length === 0 ? (
-            <div className="state emptyState">
-              <p>No properties yet.</p>
-              <Link className="button primary" href="/properties">Add your first property</Link>
-            </div>
-          ) : (
-            <div className="tableWrap">
-              <table>
-                <thead><tr><th>Property</th><th>Location</th><th>Units</th><th>Occupied</th><th>Status</th></tr></thead>
-                <tbody>{properties.map((property) => (
-                  <tr key={property.id}>
-                    <td><b>{property.name}</b><small>{property.id.slice(0, 8)}</small></td>
-                    <td>{property.location}</td>
-                    <td>{property.units}</td>
-                    <td>{property.occupied}</td>
-                    <td><span className={`status ${property.status.toLowerCase()}`}>{property.status}</span></td>
-                  </tr>
-                ))}</tbody>
-              </table>
-            </div>
-          )}
+        <section className={styles.hero} aria-labelledby="hero-title">
+          <p className={styles.eyebrow}>PROPERTY OPERATIONS, THOUGHTFULLY CONNECTED</p>
+          <h1 id="hero-title">A considered foundation for better property operations.</h1>
+          <p className={styles.intro}>
+            This is an early look at the BOWERA experience. The preview is intentionally
+            disconnected from accounts, services, and property data.
+          </p>
+          <Link className={styles.button} href="/properties">
+            Explore the preview <span aria-hidden="true">→</span>
+          </Link>
         </section>
-        <p className="footnote">Live portfolio data · Demonstration only · No authentication</p>
-      </section>
+
+        <section className={styles.previewNotice} aria-label="Preview boundaries">
+          <span className={styles.noticeIcon} aria-hidden="true">i</span>
+          <p>
+            <strong>Preview only.</strong> There is no sign-in, live data, or working
+            business functionality in this environment.
+          </p>
+        </section>
+
+        <section className={styles.areas} aria-labelledby="areas-title">
+          <div className={styles.sectionHeading}>
+            <p className={styles.eyebrow}>A WORK IN PROGRESS</p>
+            <h2 id="areas-title">Designed for the work ahead</h2>
+          </div>
+          <div className={styles.areaGrid}>
+            {previewAreas.map((area) => (
+              <article className={styles.areaCard} key={area.number}>
+                <span className={styles.areaNumber}>{area.number}</span>
+                <h3>{area.title}</h3>
+                <p>{area.detail}</p>
+                <span className={styles.status}>Not available in preview</span>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <footer className={styles.footer}>
+          <span>BOWERA · Development preview</span>
+          <span>No customer or property data is shown.</span>
+        </footer>
+      </div>
     </main>
   );
 }
